@@ -1,0 +1,45 @@
+<!--
+  Straiker policy for Azure AI Foundry third-party models (Mistral, Phi,
+  DeepSeek, Grok, etc.) — non-OpenAI but OpenAI-compatible JSON.
+
+  Verified end-to-end against Mistral-Large-3 and Phi-4 (re-verified 2026-07-22).
+  DeepSeek-V3-0324 and grok-3 deployments were retired by Azure (410 model_deprecated).
+  Same fragments as the OpenAI-protected agentic API; the differences are
+  pure URL plumbing for Foundry's services.ai.azure.com/models endpoint.
+
+  Differences from policy/examples/agentic-api.xml:
+    - serviceUrl on the API points at https://<resource>.services.ai.azure.com/models
+    - rewrite-uri strips the /v1 prefix (Foundry's URL is /chat/completions, not /v1/chat/completions)
+    - api-version query parameter is set (Foundry requires it; OpenAI ignores it)
+    - distinct straikerSource so Console shows it as a separate app
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <set-variable name="straikerAgentic" value="@(true)" />
+    <set-variable name="straikerSource"  value="apim-dev-foundry" />
+    <set-variable name="straikerDestination" value="services.ai.azure.com" />
+
+    <!-- OpenAI clients send /v1/chat/completions; Foundry expects /chat/completions -->
+    <rewrite-uri template="/chat/completions" />
+    <set-query-parameter name="api-version" exists-action="override">
+      <value>2024-05-01-preview</value>
+    </set-query-parameter>
+
+    <include-fragment fragment-id="straiker-defendai-inbound" />
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-defendai-outbound" />
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>

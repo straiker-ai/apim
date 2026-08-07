@@ -1,0 +1,380 @@
+<!--
+  Straiker DefendAI - Inbound (pre-call) detection via the WEBHOOK contract.
+
+  Converges APIM on the same /api/v1/detect/webhook contract used by the Kong
+  plugin (v0.10+) and LiteLLM through Bridge. ONE webhook for all app types -
+  no agentic vs traditional split. The FULL raw request body is forwarded and
+  Bridge builds the conversation (tool calls included) server-side; the block
+  decision comes back as a string `action` from centrally configured Straiker
+  policy, not a local score threshold.
+
+  Apply via:
+    <inbound>
+      <base />
+      <include-fragment fragment-id="straiker-webhook-inbound" />
+    </inbound>
+
+  Required APIM Named Value: straiker-api-key.
+  Configure knobs with <set-variable> BEFORE this fragment (set-if-unset
+  defaults below):
+    straikerWebhookUrl      https://api.prod.straiker.ai/api/v1/detect/webhook
+    straikerWebhookFormat   kong-gateway   (flip to apim-gateway when the
+                                            Bridge adapter lands - config only)
+    straikerSource          apim-policy    (-> consumer.appId -> Console app;
+                                            auto-created on first traffic)
+    straikerLlmFormat       openai         (openai|azureai|anthropic|bedrock|cohere|gemini)
+    straikerMode            both           (pre_call | post_call | both)
+    straikerBlockMode       http-403       (http-403 | openai-stub; stub returns a
+                                            200 chat.completion refusal that
+                                            terminates agent loops cleanly)
+    straikerFailOpen        true           (Kong parity; missing/malformed
+                                            `action` in the response counts as
+                                            failure, NOT as allow)
+    straikerStreamingPolicy reject         (reject | allow-unscanned)
+    straikerMaxBodyBytes    524288         (512 KiB, LiteLLM parity)
+    straikerOversizePolicy  bypass         (bypass | block)
+    straikerIdentityMode    headers        (headers | jwt | subscription; jwt
+                                            reads the `validatedJwt` variable
+                                            set by an upstream validate-jwt /
+                                            validate-azure-ad-token policy with
+                                            output-token-variable-name="validatedJwt")
+    straikerTimeoutSec      5
+-->
+<fragment>
+    <!-- ============ Configuration ============
+         Each knob is set-if-unset (a caller override BEFORE <include-fragment>
+         is preserved). Numeric/boolean knobs are type-normalized so a plain
+         string override (value="524288" or value="false", no @() wrapper) works
+         and never 500s the policy. -->
+    <choose>
+      <when condition="@(!context.Variables.ContainsKey("straikerApiKey"))">
+        <set-variable name="straikerApiKey" value="{{straiker-api-key}}" />
+      </when>
+    </choose>
+    <set-variable name="straikerWebhookUrl" value="@(context.Variables.ContainsKey("straikerWebhookUrl") ? (string)context.Variables["straikerWebhookUrl"] : "https://api.prod.straiker.ai/api/v1/detect/webhook")" />
+    <set-variable name="straikerWebhookFormat" value="@(context.Variables.ContainsKey("straikerWebhookFormat") ? (string)context.Variables["straikerWebhookFormat"] : "kong-gateway")" />
+    <set-variable name="straikerSource" value="@(context.Variables.ContainsKey("straikerSource") ? (string)context.Variables["straikerSource"] : "apim-policy")" />
+    <set-variable name="straikerLlmFormat" value="@(context.Variables.ContainsKey("straikerLlmFormat") ? (string)context.Variables["straikerLlmFormat"] : "openai")" />
+    <set-variable name="straikerMode" value="@(context.Variables.ContainsKey("straikerMode") ? (string)context.Variables["straikerMode"] : "both")" />
+    <set-variable name="straikerBlockMode" value="@(context.Variables.ContainsKey("straikerBlockMode") ? (string)context.Variables["straikerBlockMode"] : "http-403")" />
+    <set-variable name="straikerStreamingPolicy" value="@(context.Variables.ContainsKey("straikerStreamingPolicy") ? (string)context.Variables["straikerStreamingPolicy"] : "reject")" />
+    <set-variable name="straikerOversizePolicy" value="@(context.Variables.ContainsKey("straikerOversizePolicy") ? (string)context.Variables["straikerOversizePolicy"] : "bypass")" />
+    <set-variable name="straikerIdentityMode" value="@(context.Variables.ContainsKey("straikerIdentityMode") ? (string)context.Variables["straikerIdentityMode"] : "headers")" />
+    <set-variable name="straikerFailOpen" value="@{ var v = context.Variables.ContainsKey("straikerFailOpen") ? context.Variables["straikerFailOpen"] : null; if (v is bool b) { return b; } if (v == null) { return true; } return string.Equals(Convert.ToString(v), "true", StringComparison.OrdinalIgnoreCase); }" />
+    <set-variable name="straikerTimeoutSec" value="@{ var v = context.Variables.ContainsKey("straikerTimeoutSec") ? context.Variables["straikerTimeoutSec"] : null; if (v is int i) { return i; } int p; if (v != null && int.TryParse(Convert.ToString(v), out p)) { return p; } return 5; }" />
+    <!-- straikerMaxBodyBytes = 512 KiB text cap; straikerMaxImageBytes = larger
+         budget (4 MB) applied when the body carries attachment content parts, so
+         base64 images aren't skipped by the text cap. Straiker caps attachments at
+         5 MB each / 10 per request; raise only if APIM body limits allow. -->
+    <set-variable name="straikerMaxBodyBytes" value="@{ var v = context.Variables.ContainsKey("straikerMaxBodyBytes") ? context.Variables["straikerMaxBodyBytes"] : null; if (v is int i) { return i; } int p; if (v != null && int.TryParse(Convert.ToString(v), out p)) { return p; } return 524288; }" />
+    <set-variable name="straikerMaxImageBytes" value="@{ var v = context.Variables.ContainsKey("straikerMaxImageBytes") ? context.Variables["straikerMaxImageBytes"] : null; if (v is int i) { return i; } int p; if (v != null && int.TryParse(Convert.ToString(v), out p)) { return p; } return 4194304; }" />
+
+    <!-- Force uncompressed upstream response so the outbound fragment can
+         forward it as JSON (same gzip trap as the rich-contract fragment). -->
+    <choose>
+      <when condition="@((string)context.Variables["straikerMode"] != "pre_call")">
+        <set-header name="Accept-Encoding" exists-action="override">
+          <value>identity</value>
+        </set-header>
+      </when>
+    </choose>
+
+    <!-- Raw request body, preserved for the upstream. -->
+    <set-variable name="straikerRawBody" value="@{
+        return context.Request.Body?.As<string>(preserveContent: true) ?? "";
+    }" />
+    <set-variable name="straikerReqBody" value="@{
+        try { return JObject.Parse((string)context.Variables["straikerRawBody"]); }
+        catch { return new JObject(); }
+    }" />
+    <set-variable name="straikerIsStreaming" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        return b["stream"] != null && b["stream"].Type == JTokenType.Boolean && (bool)b["stream"];
+    }" />
+    <!-- Detect attachment content parts so multimodal requests get the larger
+         size budget and Bridge is signalled to run image/file detection.
+         Covers OpenAI (image_url / input_image / input_file), Anthropic
+         (image / document with a source object), and generic file parts. -->
+    <set-variable name="straikerHasAttachments" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var msgs = b["messages"] as JArray;
+        if (msgs == null) { return false; }
+        foreach (var raw in msgs) {
+            var m = raw as JObject;
+            var c = m?["content"] as JArray;
+            if (c == null) { continue; }
+            foreach (var p in c) {
+                var t = (string)p["type"];
+                if (t == "image_url" || t == "image" || t == "input_image"
+                    || t == "input_file" || t == "file" || t == "document") { return true; }
+            }
+        }
+        return false;
+    }" />
+    <set-variable name="straikerSizeLimit" value="@((bool)context.Variables["straikerHasAttachments"]
+        ? (int)context.Variables["straikerMaxImageBytes"]
+        : (int)context.Variables["straikerMaxBodyBytes"])" />
+    <set-variable name="straikerBodyOversize" value="@(
+        ((string)context.Variables["straikerRawBody"]).Length > (int)context.Variables["straikerSizeLimit"])" />
+
+    <!-- Streaming: no policy-XML path can scan SSE chunks (buffering kills the
+         stream), so either reject up front or pass through unscanned. -->
+    <choose>
+      <when condition="@((bool)context.Variables["straikerIsStreaming"]
+                       && (string)context.Variables["straikerStreamingPolicy"] == "reject")">
+        <return-response>
+          <set-status code="400" reason="Bad Request" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@("{\"error\":{\"message\":\"Streaming (stream=true) is not supported on this guarded route. Retry with stream=false, or use a route with straikerStreamingPolicy=allow-unscanned.\",\"code\":\"streaming_not_supported\"}}")</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- Oversize body: block or bypass detection (bypass = fail-open posture). -->
+    <choose>
+      <when condition="@((bool)context.Variables["straikerBodyOversize"]
+                       && (string)context.Variables["straikerOversizePolicy"] == "block")">
+        <return-response>
+          <set-status code="413" reason="Payload Too Large" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@("{\"error\":{\"message\":\"Request body exceeds the guarded-route size limit.\",\"code\":\"payload_too_large\"}}")</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- ============ Identity resolution ============
+         consumer.appId -> Straiker app (auto-created by name = app enumeration)
+         userInfo.id/role -> Console user attribution
+         Modes: headers (trusted x-user-* headers), jwt (validated Entra/JWT
+         claims), subscription (APIM subscription + product context). -->
+    <set-variable name="straikerAppId" value="@{
+        var mode = (string)context.Variables["straikerIdentityMode"];
+        if (mode == "jwt") {
+            var jwt = context.Variables.GetValueOrDefault<Jwt>("validatedJwt", null);
+            if (jwt != null) {
+                foreach (var c in new[] { "app_displayname", "azp", "appid" }) {
+                    if (jwt.Claims.ContainsKey(c) && jwt.Claims[c].Length > 0 && !string.IsNullOrEmpty(jwt.Claims[c][0])) { return jwt.Claims[c][0]; }
+                }
+            }
+        }
+        if (mode == "subscription" && context.Subscription != null) {
+            return "apim-sub-" + context.Subscription.Id;
+        }
+        var hdr = context.Request.Headers.GetValueOrDefault("x-app-id", "");
+        if (!string.IsNullOrEmpty(hdr)) { return hdr; }
+        return (string)context.Variables["straikerSource"];
+    }" />
+    <set-variable name="straikerAppDisplayName" value="@{
+        if (context.Product != null && !string.IsNullOrEmpty(context.Product.Name)) { return context.Product.Name; }
+        if (context.Api != null && !string.IsNullOrEmpty(context.Api.Name)) { return context.Api.Name; }
+        return (string)context.Variables["straikerAppId"];
+    }" />
+    <set-variable name="straikerUserName" value="@{
+        var mode = (string)context.Variables["straikerIdentityMode"];
+        if (mode == "jwt") {
+            var jwt = context.Variables.GetValueOrDefault<Jwt>("validatedJwt", null);
+            if (jwt != null) {
+                foreach (var c in new[] { "email", "preferred_username", "sub" }) {
+                    if (jwt.Claims.ContainsKey(c) && jwt.Claims[c].Length > 0 && !string.IsNullOrEmpty(jwt.Claims[c][0])) { return jwt.Claims[c][0]; }
+                }
+            }
+        }
+        var hdr = context.Request.Headers.GetValueOrDefault("x-user-name", "");
+        if (!string.IsNullOrEmpty(hdr)) { return hdr; }
+        var b = (JObject)context.Variables["straikerReqBody"];
+        if (b["user"] != null && b["user"].Type == JTokenType.String) { return (string)b["user"]; }
+        return "apim";
+    }" />
+    <set-variable name="straikerUserRole" value="@{
+        var mode = (string)context.Variables["straikerIdentityMode"];
+        if (mode == "jwt") {
+            var jwt = context.Variables.GetValueOrDefault<Jwt>("validatedJwt", null);
+            if (jwt != null && jwt.Claims.ContainsKey("roles") && jwt.Claims["roles"].Length > 0) { return jwt.Claims["roles"][0]; }
+        }
+        return context.Request.Headers.GetValueOrDefault("x-user-role", "public");
+    }" />
+    <set-variable name="straikerSessionId" value="@(context.Request.Headers.GetValueOrDefault("x-session-id", context.RequestId.ToString()))" />
+
+    <!-- Last user prompt (best-effort request.text; Bridge re-derives from body anyway). -->
+    <set-variable name="straikerPrompt" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var msgs = b["messages"] as JArray;
+        if (msgs == null) { return ""; }
+        for (int i = msgs.Count - 1; i >= 0; i--) {
+            var m = msgs[i] as JObject;
+            if (m != null && (string)m["role"] == "user") {
+                var c = m["content"];
+                if (c == null) { return ""; }
+                if (c.Type == JTokenType.String) { return (string)c; }
+                if (c.Type == JTokenType.Array) {
+                    foreach (var part in (JArray)c) {
+                        if ((string)part["type"] == "text") { return (string)part["text"]; }
+                    }
+                }
+                return "";
+            }
+        }
+        return "";
+    }" />
+
+    <choose>
+      <when condition="@((string)context.Variables["straikerMode"] == "post_call")">
+        <!-- pre-call disabled -->
+      </when>
+      <when condition="@((bool)context.Variables["straikerBodyOversize"])">
+        <!-- oversize + bypass: skip detection, logged via straikerBodyOversize -->
+      </when>
+      <when condition="@((bool)context.Variables["straikerIsStreaming"])">
+        <!-- allow-unscanned streaming: skip detection -->
+      </when>
+      <otherwise>
+        <retry condition="@(context.Variables.GetValueOrDefault<IResponse>("straikerPreResp", null) == null
+                          || context.Variables.GetValueOrDefault<IResponse>("straikerPreResp").StatusCode >= 500)"
+               count="1" interval="1" first-fast-retry="true">
+          <send-request mode="new" response-variable-name="straikerPreResp"
+                        timeout="@((int)context.Variables["straikerTimeoutSec"])"
+                        ignore-error="true">
+            <set-url>@((string)context.Variables["straikerWebhookUrl"])</set-url>
+            <set-method>POST</set-method>
+            <set-header name="Authorization" exists-action="override">
+              <value>@("Bearer " + (string)context.Variables["straikerApiKey"])</value>
+            </set-header>
+            <set-header name="Content-Type" exists-action="override">
+              <value>application/json</value>
+            </set-header>
+            <set-header name="X-Straiker-Webhook-Format" exists-action="override">
+              <value>@((string)context.Variables["straikerWebhookFormat"])</value>
+            </set-header>
+            <set-header name="X-Straiker-Smart-Publish" exists-action="override">
+              <value>true</value>
+            </set-header>
+            <set-body>@{
+                var envelope = new JObject {
+                    ["eventType"] = "pre_call",
+                    ["request"] = new JObject {
+                        ["body"] = (JObject)context.Variables["straikerReqBody"],
+                        ["text"] = (string)context.Variables["straikerPrompt"]
+                    },
+                    ["userInfo"] = new JObject {
+                        ["id"]   = (string)context.Variables["straikerUserName"],
+                        ["role"] = (string)context.Variables["straikerUserRole"]
+                    },
+                    ["consumer"] = new JObject {
+                        ["appId"]     = (string)context.Variables["straikerAppId"],
+                        ["name"]      = (string)context.Variables["straikerAppDisplayName"],
+                        ["custom_id"] = context.Subscription != null ? context.Subscription.Id : ""
+                    },
+                    ["aiContext"] = new JObject {
+                        ["llm_format"] = (string)context.Variables["straikerLlmFormat"],
+                        ["model"] = new JObject {
+                            ["name"] = (string)(((JObject)context.Variables["straikerReqBody"])["model"] ?? "unknown")
+                        }
+                    },
+                    ["metadata"] = new JObject {
+                        ["session_id"] = (string)context.Variables["straikerSessionId"],
+                        ["trace_id"]   = context.Request.Headers.GetValueOrDefault("x-trace-id", ""),
+                        ["client_ip"]  = context.Request.IpAddress ?? "127.0.0.1",
+                        ["gateway"]    = "azure-apim"
+                    }
+                };
+                return envelope.ToString(Newtonsoft.Json.Formatting.None);
+            }</set-body>
+          </send-request>
+        </retry>
+
+        <!-- Verdict: string action from centrally configured Straiker policy.
+             A 200 with no `action` field counts as FAILURE (catches an unknown
+             webhook format silently degrading to allow-everything). -->
+        <set-variable name="straikerAction" value="@{
+            var r = context.Variables.GetValueOrDefault<IResponse>("straikerPreResp", null);
+            if (r == null || r.StatusCode != 200) { return "__unavailable__"; }
+            try {
+                var body = r.Body.As<JObject>(preserveContent: true);
+                var a = body["action"];
+                if (a == null || a.Type != JTokenType.String) { return "__unavailable__"; }
+                return ((string)a).ToLowerInvariant();
+            } catch { return "__unavailable__"; }
+        }" />
+        <set-variable name="straikerTurnId" value="@{
+            var r = context.Variables.GetValueOrDefault<IResponse>("straikerPreResp", null);
+            if (r == null || r.StatusCode != 200) { return ""; }
+            try {
+                var body = r.Body.As<JObject>(preserveContent: true);
+                return (string)(body["turn_id"] ?? body["turnId"] ?? "");
+            } catch { return ""; }
+        }" />
+
+        <choose>
+          <when condition="@((string)context.Variables["straikerAction"] == "block"
+                          && (string)context.Variables["straikerBlockMode"] == "openai-stub")">
+            <set-variable name="straikerBlocked" value="@(true)" />
+            <return-response>
+              <set-status code="200" reason="OK" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="x-straiker-verdict" exists-action="override">
+                <value>block</value>
+              </set-header>
+              <set-body>@{
+                  var b = (JObject)context.Variables["straikerReqBody"];
+                  var stub = new JObject {
+                      ["id"] = "chatcmpl-straiker-blocked",
+                      ["object"] = "chat.completion",
+                      ["created"] = (long)(context.Timestamp - new DateTime(1970, 1, 1)).TotalSeconds,
+                      ["model"] = (string)(b["model"] ?? "unknown"),
+                      ["choices"] = new JArray {
+                          new JObject {
+                              ["index"] = 0,
+                              ["message"] = new JObject {
+                                  ["role"] = "assistant",
+                                  ["content"] = "I'm sorry, I'm unable to process that request."
+                              },
+                              ["finish_reason"] = "stop"
+                          }
+                      },
+                      ["usage"] = new JObject {
+                          ["prompt_tokens"] = 0, ["completion_tokens"] = 0, ["total_tokens"] = 0
+                      }
+                  };
+                  return stub.ToString(Newtonsoft.Json.Formatting.None);
+              }</set-body>
+            </return-response>
+          </when>
+          <when condition="@((string)context.Variables["straikerAction"] == "block")">
+            <set-variable name="straikerBlocked" value="@(true)" />
+            <return-response>
+              <set-status code="403" reason="Forbidden" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@{
+                  var err = new JObject {
+                      ["error"] = new JObject {
+                          ["message"] = "Straiker: request blocked by policy (pre-call)",
+                          ["turn_id"] = (string)context.Variables["straikerTurnId"],
+                          ["code"]    = "403"
+                      }
+                  };
+                  return err.ToString(Newtonsoft.Json.Formatting.None);
+              }</set-body>
+            </return-response>
+          </when>
+          <when condition="@((string)context.Variables["straikerAction"] == "__unavailable__"
+                          && !(bool)context.Variables["straikerFailOpen"])">
+            <return-response>
+              <set-status code="503" reason="Service Unavailable" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@("{\"error\":{\"message\":\"Straiker unavailable\",\"code\":\"503\"}}")</set-body>
+            </return-response>
+          </when>
+        </choose>
+      </otherwise>
+    </choose>
+</fragment>

@@ -1,0 +1,32 @@
+<!--
+  Example: Straiker policy in agentic mode (multi-turn agent loops with tools).
+
+  Behaviour:
+    - Pre-call detection runs only on the first iteration (last message role == user).
+    - Tool/assistant continuation iterations are skipped at pre-call.
+    - Post-call detection runs only on the final iteration (response has no tool_calls).
+    - The final post-call carries the entire messages[] array including all tool calls
+      and tool results, so one Console turn captures the whole agent run.
+
+  straiker-source MUST match an existing agentic Straiker app — agentic ingest looks
+  the app up by source/name. Create the app first in the Straiker Console.
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="straikerApiKey"   value="{{straiker-api-key}}" />
+    <set-variable name="straikerMode"      value="both" />
+    <set-variable name="straikerAgentic"   value="@(true)" />
+    <set-variable name="straikerSource"      value="my-agent-app" />     <!-- must match Straiker app name -->
+    <set-variable name="straikerDestination" value="api.openai.com" />
+    <set-variable name="straikerThreshold"   value="@(0.5)" />
+    <set-variable name="straikerTimeoutSec"  value="@(5)" />
+    <set-variable name="straikerFailOpen"    value="@(false)" />
+
+    <!-- Paste straiker-policy.xml <inbound> body here. -->
+  </inbound>
+  <outbound>
+    <base />
+    <!-- Paste straiker-policy.xml <outbound> body here. -->
+  </outbound>
+</policies>

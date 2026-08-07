@@ -1,0 +1,61 @@
+<!--
+  Example: Straiker policy in front of Azure AI Foundry third-party models
+  (Mistral, Phi, DeepSeek, Grok, etc).
+
+  Topology:
+    Client  →  APIM  →  Foundry models endpoint  (customer's resource, customer's keys)
+                ↓ side call
+            Straiker /detect[?agentic]
+
+  Foundry third-party models live at a DIFFERENT URL than Azure OpenAI:
+
+    Azure OpenAI (gpt-*):
+        https://<resource>.cognitiveservices.azure.com
+        + /openai/deployments/{deployment}/chat/completions?api-version=...
+        (use azure-openai-passthrough.xml)
+
+    Foundry third-party (Mistral / Phi / DeepSeek / Grok / etc):
+        https://<resource>.services.ai.azure.com/models
+        + /chat/completions?api-version=...    (model name in body)
+
+  To serve both endpoint types, either (a) use two separate APIs (one per
+  backend) and apply this policy to each, or (b) use a single API with a
+  <choose> block that routes on body.model.
+
+  Backend wiring (per API):
+    - Add an APIM Backend pointing at https://<your-resource>.services.ai.azure.com/models
+    - Configure managed-identity auth on that Backend with resource id
+      https://cognitiveservices.azure.com  (Foundry shares the cognitiveservices
+      audience even on the services.ai endpoint)
+    - Operation URL template: /chat/completions
+    - Pass api-version as a query parameter or set it via <set-query-parameter>
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- Straiker config -->
+    <set-variable name="straikerApiKey"   value="{{straiker-api-key}}" />
+    <set-variable name="straikerMode"      value="both" />
+    <set-variable name="straikerAgentic"   value="@(true)" />
+    <set-variable name="straikerSource"      value="foundry-prod-app" />
+    <set-variable name="straikerDestination" value="foundry" />
+    <set-variable name="straikerThreshold"   value="@(0.5)" />
+    <set-variable name="straikerTimeoutSec"  value="@(5)" />
+    <set-variable name="straikerFailOpen"    value="@(false)" />
+
+    <!-- Authenticate to Foundry with APIM managed identity. -->
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+    <set-backend-service backend-id="azure-foundry-prod" />
+    <!-- Foundry requires an explicit api-version. -->
+    <set-query-parameter name="api-version" exists-action="override">
+      <value>2024-05-01-preview</value>
+    </set-query-parameter>
+
+    <!-- Then paste the Straiker pre-call block from straiker-policy.xml here. -->
+  </inbound>
+  <outbound>
+    <base />
+    <!-- Then paste the Straiker post-call block from straiker-policy.xml here. -->
+  </outbound>
+</policies>

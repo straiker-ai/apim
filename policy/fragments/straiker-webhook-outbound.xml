@@ -1,0 +1,213 @@
+<!--
+  Straiker DefendAI - Outbound (post-call) detection via the WEBHOOK contract.
+
+  Companion to straiker-webhook-inbound. Forwards the raw upstream response in
+  the webhook envelope; Bridge appends the assistant reply to the conversation
+  server-side. X-Straiker-Smart-Publish gives server-side turn dedup, so there
+  is no client-side agent-loop iteration logic here.
+
+  Apply via:
+    <outbound>
+      <base />
+      <include-fragment fragment-id="straiker-webhook-outbound" />
+    </outbound>
+
+  Reads variables set by the inbound fragment. Own knob (set-if-unset):
+    straikerPostCallMode  enforce   enforce = synchronous send-request; can
+                                    replace the response when action=block
+                          observe   fire-and-forget send-one-way-request;
+                                    zero added latency, never blocks
+                          off       skip post-call entirely
+-->
+<fragment>
+    <set-variable name="straikerPostCallMode" value="@(context.Variables.ContainsKey("straikerPostCallMode") ? (string)context.Variables["straikerPostCallMode"] : "enforce")" />
+
+    <choose>
+      <when condition="@((string)context.Variables.GetValueOrDefault<string>("straikerPostCallMode", "enforce") == "off"
+                       || (string)context.Variables.GetValueOrDefault<string>("straikerMode", "both") == "pre_call"
+                       || context.Variables.GetValueOrDefault<bool>("straikerBlocked", false)
+                       || context.Variables.GetValueOrDefault<bool>("straikerIsStreaming", false)
+                       || context.Variables.GetValueOrDefault<bool>("straikerBodyOversize", false))">
+        <!-- skip post-call -->
+      </when>
+      <otherwise>
+        <set-variable name="straikerRespRaw" value="@{
+            try { return context.Response.Body.As<string>(preserveContent: true) ?? ""; }
+            catch { return ""; }
+        }" />
+        <set-variable name="straikerRespBody" value="@{
+            try { return JObject.Parse((string)context.Variables["straikerRespRaw"]); }
+            catch { return new JObject(); }
+        }" />
+        <set-variable name="straikerRespText" value="@{
+            var r = (JObject)context.Variables["straikerRespBody"];
+            var msg = r["choices"]?[0]?["message"];
+            if (msg != null && msg["content"] != null && msg["content"].Type == JTokenType.String) { return (string)msg["content"]; }
+            return "";
+        }" />
+        <set-variable name="straikerPostEnvelope" value="@{
+            var envelope = new JObject {
+                ["eventType"] = "post_call",
+                ["request"] = new JObject {
+                    ["body"] = (JObject)context.Variables["straikerReqBody"],
+                    ["text"] = (string)context.Variables.GetValueOrDefault<string>("straikerPrompt", "")
+                },
+                ["response"] = new JObject {
+                    ["stream"] = false,
+                    ["body"]   = (JObject)context.Variables["straikerRespBody"],
+                    ["text"]   = (string)context.Variables["straikerRespText"]
+                },
+                ["userInfo"] = new JObject {
+                    ["id"]   = (string)context.Variables.GetValueOrDefault<string>("straikerUserName", "apim"),
+                    ["role"] = (string)context.Variables.GetValueOrDefault<string>("straikerUserRole", "public")
+                },
+                ["consumer"] = new JObject {
+                    ["appId"]     = (string)context.Variables.GetValueOrDefault<string>("straikerAppId", "apim-policy"),
+                    ["name"]      = (string)context.Variables.GetValueOrDefault<string>("straikerAppDisplayName", "apim-policy"),
+                    ["custom_id"] = context.Subscription != null ? context.Subscription.Id : ""
+                },
+                ["aiContext"] = new JObject {
+                    ["llm_format"] = (string)context.Variables.GetValueOrDefault<string>("straikerLlmFormat", "openai"),
+                    ["model"] = new JObject {
+                        ["name"] = (string)(((JObject)context.Variables["straikerRespBody"])["model"]
+                                   ?? ((JObject)context.Variables["straikerReqBody"])["model"] ?? "unknown")
+                    }
+                },
+                ["metadata"] = new JObject {
+                    ["session_id"] = (string)context.Variables.GetValueOrDefault<string>("straikerSessionId", context.RequestId.ToString()),
+                    ["trace_id"]   = context.Request.Headers.GetValueOrDefault("x-trace-id", ""),
+                    ["client_ip"]  = context.Request.IpAddress ?? "127.0.0.1",
+                    ["gateway"]    = "azure-apim"
+                }
+            };
+            return envelope.ToString(Newtonsoft.Json.Formatting.None);
+        }" />
+
+        <choose>
+          <when condition="@((string)context.Variables["straikerPostCallMode"] == "observe")">
+            <!-- Fire-and-forget: zero added latency, observability only.
+                 NOTE: send-one-way-request timeout must be a LITERAL int -
+                 policy expressions are rejected here (unlike send-request). -->
+            <send-one-way-request mode="new" timeout="5">
+              <set-url>@((string)context.Variables["straikerWebhookUrl"])</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["straikerApiKey"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="X-Straiker-Webhook-Format" exists-action="override">
+                <value>@((string)context.Variables["straikerWebhookFormat"])</value>
+              </set-header>
+              <set-header name="X-Straiker-Smart-Publish" exists-action="override">
+                <value>true</value>
+              </set-header>
+              <set-body>@((string)context.Variables["straikerPostEnvelope"])</set-body>
+            </send-one-way-request>
+          </when>
+          <otherwise>
+            <send-request mode="new" response-variable-name="straikerPostResp"
+                          timeout="@((int)context.Variables.GetValueOrDefault<int>("straikerTimeoutSec", 5))"
+                          ignore-error="true">
+              <set-url>@((string)context.Variables["straikerWebhookUrl"])</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["straikerApiKey"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="X-Straiker-Webhook-Format" exists-action="override">
+                <value>@((string)context.Variables["straikerWebhookFormat"])</value>
+              </set-header>
+              <set-header name="X-Straiker-Smart-Publish" exists-action="override">
+                <value>true</value>
+              </set-header>
+              <set-body>@((string)context.Variables["straikerPostEnvelope"])</set-body>
+            </send-request>
+
+            <set-variable name="straikerPostAction" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerPostResp", null);
+                if (r == null || r.StatusCode != 200) { return "__unavailable__"; }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    var a = body["action"];
+                    if (a == null || a.Type != JTokenType.String) { return "__unavailable__"; }
+                    return ((string)a).ToLowerInvariant();
+                } catch { return "__unavailable__"; }
+            }" />
+            <set-variable name="straikerPostTurnId" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerPostResp", null);
+                if (r == null || r.StatusCode != 200) { return ""; }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    return (string)(body["turn_id"] ?? body["turnId"] ?? "");
+                } catch { return ""; }
+            }" />
+
+            <!-- Output gating: replace the upstream response when centrally
+                 configured policy says block. Post-call failures always fail
+                 open (the answer already exists; never withhold it on an
+                 availability error). -->
+            <choose>
+              <when condition="@((string)context.Variables["straikerPostAction"] == "block"
+                              && (string)context.Variables.GetValueOrDefault<string>("straikerBlockMode", "http-403") == "openai-stub")">
+                <return-response>
+                  <set-status code="200" reason="OK" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-header name="x-straiker-verdict" exists-action="override">
+                    <value>block</value>
+                  </set-header>
+                  <set-body>@{
+                      var b = (JObject)context.Variables["straikerReqBody"];
+                      var stub = new JObject {
+                          ["id"] = "chatcmpl-straiker-blocked",
+                          ["object"] = "chat.completion",
+                          ["created"] = (long)(context.Timestamp - new DateTime(1970, 1, 1)).TotalSeconds,
+                          ["model"] = (string)(b["model"] ?? "unknown"),
+                          ["choices"] = new JArray {
+                              new JObject {
+                                  ["index"] = 0,
+                                  ["message"] = new JObject {
+                                      ["role"] = "assistant",
+                                      ["content"] = "I'm sorry, I'm unable to process that request."
+                                  },
+                                  ["finish_reason"] = "stop"
+                              }
+                          },
+                          ["usage"] = new JObject {
+                              ["prompt_tokens"] = 0, ["completion_tokens"] = 0, ["total_tokens"] = 0
+                          }
+                      };
+                      return stub.ToString(Newtonsoft.Json.Formatting.None);
+                  }</set-body>
+                </return-response>
+              </when>
+              <when condition="@((string)context.Variables["straikerPostAction"] == "block")">
+                <return-response>
+                  <set-status code="403" reason="Forbidden" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-body>@{
+                      var err = new JObject {
+                          ["error"] = new JObject {
+                              ["message"] = "Straiker: response blocked by policy (post-call). Final output withheld.",
+                              ["turn_id"] = (string)context.Variables["straikerPostTurnId"],
+                              ["phase"]   = "post_call",
+                              ["code"]    = "403"
+                          }
+                      };
+                      return err.ToString(Newtonsoft.Json.Formatting.None);
+                  }</set-body>
+                </return-response>
+              </when>
+            </choose>
+          </otherwise>
+        </choose>
+      </otherwise>
+    </choose>
+</fragment>

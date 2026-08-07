@@ -1,0 +1,19 @@
+{
+  "eventType": "pre_call",
+  "request": {
+    "body": {
+      "model": "gpt-4o",
+      "messages": [
+        {"role": "user", "content": [
+          {"type": "text", "text": "What is in this image?"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}}
+        ]}
+      ]
+    },
+    "text": "What is in this image?"
+  },
+  "userInfo": {"id": "fixture-user@example.com", "role": "public"},
+  "consumer": {"appId": "apim-dev-webhook-canary", "name": "apim-dev-webhook-canary", "custom_id": "sub-fixture"},
+  "aiContext": {"llm_format": "openai", "model": {"name": "gpt-4o"}},
+  "metadata": {"session_id": "fixture-mm-1", "trace_id": "", "client_ip": "127.0.0.1", "gateway": "azure-apim"}
+}

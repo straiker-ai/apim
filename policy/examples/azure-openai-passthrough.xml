@@ -1,0 +1,43 @@
+<!--
+  Example: Straiker policy in front of an Azure OpenAI deployment.
+
+  Topology:
+    Client  →  APIM  →  Azure OpenAI  (customer's own deployment, customer's keys)
+                ↓ side call
+            Straiker /detect[?agentic]
+
+  Customer-side: APIM holds the Azure OpenAI key in a Named Value (or, preferred,
+  authenticates to the AOAI deployment with APIM's managed identity). Straiker
+  never sees the AOAI key — only the prompt/response/messages payload sent to /detect.
+
+  Backend wiring (one-time, per API):
+    - Add an APIM Backend pointing at https://<aoai-name>.openai.azure.com
+    - Configure managed-identity auth on that Backend with resource id
+      https://cognitiveservices.azure.com
+    - Operation URL template: /openai/deployments/{deployment-id}/chat/completions
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- ============ Straiker config ============ -->
+    <set-variable name="straikerApiKey"   value="{{straiker-api-key}}" />
+    <set-variable name="straikerMode"      value="both" />
+    <set-variable name="straikerAgentic"   value="@(true)" />
+    <set-variable name="straikerSource"      value="aoai-prod-app" />
+    <set-variable name="straikerDestination" value="aoai" />
+    <set-variable name="straikerThreshold"   value="@(0.5)" />
+    <set-variable name="straikerTimeoutSec"  value="@(5)" />
+    <set-variable name="straikerFailOpen"    value="@(false)" />
+
+    <!-- Authenticate to AOAI with APIM managed identity instead of an API key. -->
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+    <set-backend-service backend-id="azure-openai-prod" />
+
+    <!-- Then paste the Straiker pre-call block from straiker-policy.xml here. -->
+  </inbound>
+  <outbound>
+    <base />
+    <!-- Then paste the Straiker post-call block from straiker-policy.xml here. -->
+  </outbound>
+</policies>

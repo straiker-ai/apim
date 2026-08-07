@@ -1,0 +1,38 @@
+<!--
+  Full API policy for an agentic endpoint, using the shared Policy Fragments.
+
+  Apply this XML to a second API (e.g. openai-protected-agentic at path
+  /protected-agentic) so customers can hit one API for chatbot traffic and a
+  second for agentic, both protected by the same fragments.
+
+  See docs/agentic-mode.md for the full set-up walkthrough.
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- Flip the fragment into agentic mode -->
+    <set-variable name="straikerAgentic" value="@(true)" />
+
+    <!-- Distinct app name in Straiker Console (auto-creates on first call) -->
+    <set-variable name="straikerSource"  value="apim-dev-agentic" />
+
+    <!-- Recorded in detection metadata; set to whatever your upstream provider is -->
+    <set-variable name="straikerDestination" value="api.openai.com" />
+
+    <include-fragment fragment-id="straiker-defendai-inbound" />
+  </inbound>
+
+  <backend>
+    <base />
+  </backend>
+
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-defendai-outbound" />
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>

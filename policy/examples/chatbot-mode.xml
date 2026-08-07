@@ -1,0 +1,32 @@
+<!--
+  Example: Straiker policy in chatbot mode (single-turn, non-agentic).
+
+  Scope: apply at API or Operation level on an OpenAI-compatible chat
+  completions endpoint (https://api.openai.com/v1/chat/completions or
+  Azure OpenAI deployment URL). The full policy lives in straiker-policy.xml;
+  this example only highlights the configuration knobs you typically tune.
+
+  Required APIM Named Value: straiker-api-key (Key Vault-backed).
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="straikerApiKey"   value="{{straiker-api-key}}" />
+    <set-variable name="straikerMode"      value="both" />
+    <set-variable name="straikerAgentic"   value="@(false)" />
+    <set-variable name="straikerSource"      value="my-chatbot" />
+    <set-variable name="straikerDestination" value="api.openai.com" />
+    <set-variable name="straikerThreshold"   value="@(0.5)" />
+    <set-variable name="straikerTimeoutSec"  value="@(5)" />
+    <set-variable name="straikerFailOpen"    value="@(false)" />
+
+    <!-- Paste the body of straiker-policy.xml <inbound> here, OR include the
+         pre-inbound fragment if you've published one in your APIM instance:
+         <include-fragment fragment-id="straiker-pre-inbound" />              -->
+  </inbound>
+  <outbound>
+    <base />
+    <!-- Paste straiker-policy.xml <outbound> body here, OR:
+         <include-fragment fragment-id="straiker-post-outbound" />            -->
+  </outbound>
+</policies>

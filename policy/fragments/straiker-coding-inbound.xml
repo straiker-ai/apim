@@ -1,0 +1,393 @@
+<!--
+  Straiker - Coding agent (Claude Code) INBOUND detection.
+
+  Protects coding agents (Claude Code, and Anthropic-Messages-shaped agents)
+  routed through APIM. Reconstructs Claude Code hook events from the wire and
+  posts them to /api/v1/detect - the SAME backend pipeline the natively
+  installed Straiker hooks use, so detection is at parity by construction.
+
+  Apply via:
+    <inbound>
+      <base />
+      <include-fragment fragment-id="straiker-coding-inbound" />
+    </inbound>
+
+  Required APIM Named Value: straiker-coding-api-key (the Defend coding-agent
+  application key). Configure knobs with <set-variable> BEFORE this fragment.
+
+  ============================ MODES ============================
+  straikerCodingMode:
+    detect   (default) ASYNC - fires send-one-way-request, never waits for a
+             verdict, adds ~0 latency and STREAMING KEEPS WORKING (stream:true
+             passes through untouched). Monitor-only: cannot block.
+    enforce  SYNCHRONOUS - waits for the verdict and blocks before the model
+             is called. Pair with straiker-coding-outbound to also block tool
+             calls before the client executes them (that path buffers the
+             response, so streaming is lost - the standard tradeoff).
+
+  straikerCodingContract:
+    hooks    (default) Reconstructs hook events, posts x-tool: claude-code.
+             WORKS ON PROD TODAY.
+    gateway  Forwards the RAW request body, posts x-tool: kong-claude-code and
+             lets Straiker build the events server-side. Requires the gateway
+             path to be enabled on the tenant - until then the endpoint returns
+             HTTP 400.
+  ===============================================================
+-->
+<fragment>
+    <!-- ============ Configuration (set-if-unset; string overrides are fine) ============ -->
+    <choose>
+      <when condition="@(!context.Variables.ContainsKey("straikerCodingKey"))">
+        <set-variable name="straikerCodingKey" value="{{straiker-coding-api-key}}" />
+      </when>
+    </choose>
+    <set-variable name="straikerDetectUrl" value="@(context.Variables.ContainsKey("straikerDetectUrl") ? (string)context.Variables["straikerDetectUrl"] : "https://api.prod.straiker.ai/api/v1/detect")" />
+    <set-variable name="straikerCodingMode" value="@(context.Variables.ContainsKey("straikerCodingMode") ? (string)context.Variables["straikerCodingMode"] : "detect")" />
+    <set-variable name="straikerCodingContract" value="@(context.Variables.ContainsKey("straikerCodingContract") ? (string)context.Variables["straikerCodingContract"] : "hooks")" />
+    <set-variable name="straikerXTool" value="@{
+        if (context.Variables.ContainsKey("straikerXTool")) { return (string)context.Variables["straikerXTool"]; }
+        return ((string)context.Variables["straikerCodingContract"] == "gateway") ? "kong-claude-code" : "claude-code";
+    }" />
+    <set-variable name="straikerBlockMode" value="@(context.Variables.ContainsKey("straikerBlockMode") ? (string)context.Variables["straikerBlockMode"] : "anthropic-stub")" />
+    <set-variable name="straikerTimeoutSec" value="@{ var v = context.Variables.ContainsKey("straikerTimeoutSec") ? context.Variables["straikerTimeoutSec"] : null; if (v is int i) { return i; } int p; if (v != null && int.TryParse(Convert.ToString(v), out p)) { return p; } return 5; }" />
+    <set-variable name="straikerFailOpen" value="@{ var v = context.Variables.ContainsKey("straikerFailOpen") ? context.Variables["straikerFailOpen"] : null; if (v is bool b) { return b; } if (v == null) { return true; } return string.Equals(Convert.ToString(v), "true", StringComparison.OrdinalIgnoreCase); }" />
+
+    <!-- ============ Parse the coding-agent request ============ -->
+    <set-variable name="straikerRawBody" value="@{
+        try { return context.Request.Body?.As<string>(preserveContent: true) ?? ""; } catch { return ""; }
+    }" />
+    <set-variable name="straikerReqBody" value="@{
+        try { return JObject.Parse((string)context.Variables["straikerRawBody"]); } catch { return new JObject(); }
+    }" />
+
+    <!-- Session id: Claude Code packs it into metadata.user_id as a JSON string;
+         an explicit x-claude-code-session-id header wins. No session -> Straiker
+         scores nothing, so fall back to the APIM request id. -->
+    <set-variable name="straikerSessionId" value="@{
+        var hdr = context.Request.Headers.GetValueOrDefault("x-claude-code-session-id", "");
+        if (!string.IsNullOrEmpty(hdr)) { return hdr; }
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var uid = b["metadata"]?["user_id"];
+        if (uid != null && uid.Type == JTokenType.String) {
+            try {
+                var parsed = JObject.Parse((string)uid);
+                var sid = (string)parsed["session_id"];
+                if (!string.IsNullOrEmpty(sid)) { return sid; }
+            } catch { }
+        }
+        var direct = b["metadata"]?["session_id"];
+        if (direct != null && direct.Type == JTokenType.String) { return (string)direct; }
+        return context.RequestId.ToString();
+    }" />
+    <set-variable name="straikerUserName" value="@{
+        var h = context.Request.Headers.GetValueOrDefault("x-straiker-user", "");
+        if (!string.IsNullOrEmpty(h)) { return h; }
+        h = context.Request.Headers.GetValueOrDefault("x-user-name", "");
+        if (!string.IsNullOrEmpty(h)) { return h; }
+        return context.Subscription != null ? ("apim-sub-" + context.Subscription.Id) : "apim";
+    }" />
+    <set-variable name="straikerModel" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var m = b["model"];
+        return (m != null && m.Type == JTokenType.String) ? (string)m : "unknown";
+    }" />
+
+    <!-- Is this coding-agent traffic? Body-shape fingerprint, mirroring the Kong
+         plugin: the Claude Code core tool set, or a system prompt that marks it. -->
+    <set-variable name="straikerIsCoding" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var tools = b["tools"] as JArray;
+        if (tools != null) {
+            foreach (var t in tools) {
+                var n = (string)(t["name"] ?? "");
+                if (n == "Bash" || n == "Read" || n == "Edit" || n == "TodoWrite") { return true; }
+            }
+        }
+        var sys = b["system"];
+        string sysText = "";
+        if (sys != null && sys.Type == JTokenType.String) { sysText = (string)sys; }
+        else if (sys != null && sys.Type == JTokenType.Array) {
+            foreach (var blk in (JArray)sys) {
+                var t = blk["text"];
+                if (t != null && t.Type == JTokenType.String) { sysText = sysText + " " + (string)t; }
+            }
+        }
+        sysText = sysText.ToLowerInvariant();
+        if (sysText.Contains("claude code") || sysText.Contains("cc_version=") || sysText.Contains("claude agent")) { return true; }
+        var ua = context.Request.Headers.GetValueOrDefault("User-Agent", "").ToLowerInvariant();
+        return ua.StartsWith("claude-cli/") || ua.StartsWith("cursor/");
+    }" />
+
+    <!-- Utility/title-generation chatter has no tools and must not be scored:
+         it is the main false-positive source (~23% of Claude Code calls). -->
+    <set-variable name="straikerIsUtility" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var tools = b["tools"] as JArray;
+        return tools == null || tools.Count == 0;
+    }" />
+
+    <!-- The user prompt = last user text block (skips tool_result-only turns). -->
+    <set-variable name="straikerPrompt" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var msgs = b["messages"] as JArray;
+        if (msgs == null) { return ""; }
+        for (int i = msgs.Count - 1; i >= 0; i--) {
+            var m = msgs[i] as JObject;
+            if (m == null || (string)m["role"] != "user") { continue; }
+            var c = m["content"];
+            if (c == null) { continue; }
+            if (c.Type == JTokenType.String) { return (string)c; }
+            if (c.Type == JTokenType.Array) {
+                foreach (var part in (JArray)c) {
+                    if ((string)part["type"] == "text") { return (string)part["text"]; }
+                }
+            }
+        }
+        return "";
+    }" />
+
+    <!-- The newest tool_result carried back in the transcript. This is the
+         indirect-prompt-injection surface (poisoned file/web/MCP content). -->
+    <set-variable name="straikerToolResult" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var msgs = b["messages"] as JArray;
+        var found = new JObject();
+        if (msgs == null) { return found; }
+        for (int i = msgs.Count - 1; i >= 0; i--) {
+            var m = msgs[i] as JObject;
+            if (m == null || (string)m["role"] != "user") { continue; }
+            var c = m["content"] as JArray;
+            if (c == null) { continue; }
+            foreach (var part in c) {
+                if ((string)part["type"] != "tool_result") { continue; }
+                var content = part["content"];
+                string text = "";
+                if (content != null && content.Type == JTokenType.String) { text = (string)content; }
+                else if (content != null && content.Type == JTokenType.Array) {
+                    foreach (var p2 in (JArray)content) {
+                        if ((string)p2["type"] == "text") { text = text + (string)p2["text"]; }
+                    }
+                }
+                found["tool_use_id"] = part["tool_use_id"];
+                found["content"] = text;
+                found["is_error"] = part["is_error"] != null && part["is_error"].Type == JTokenType.Boolean && (bool)part["is_error"];
+                return found;
+            }
+            break;
+        }
+        return found;
+    }" />
+    <!-- Name the tool that produced that result, by matching the tool_use id. -->
+    <set-variable name="straikerToolResultName" value="@{
+        var b = (JObject)context.Variables["straikerReqBody"];
+        var tr = (JObject)context.Variables["straikerToolResult"];
+        var id = (string)(tr["tool_use_id"] ?? "");
+        if (string.IsNullOrEmpty(id)) { return ""; }
+        var msgs = b["messages"] as JArray;
+        if (msgs == null) { return ""; }
+        for (int i = msgs.Count - 1; i >= 0; i--) {
+            var m = msgs[i] as JObject;
+            if (m == null || (string)m["role"] != "assistant") { continue; }
+            var c = m["content"] as JArray;
+            if (c == null) { continue; }
+            foreach (var part in c) {
+                if ((string)part["type"] == "tool_use" && (string)part["id"] == id) { return (string)part["name"]; }
+            }
+        }
+        return "";
+    }" />
+
+    <!-- The event this request should be scored as: PostToolUse when a tool
+         result just came back (IPI), else UserPromptSubmit (prompt injection). -->
+    <set-variable name="straikerEventBody" value="@{
+        var contract = (string)context.Variables["straikerCodingContract"];
+        if (contract == "gateway") {
+            // Gateway contract: forward the raw wire, Straiker builds the events.
+            return (string)context.Variables["straikerRawBody"];
+        }
+        var tr = (JObject)context.Variables["straikerToolResult"];
+        var sid = (string)context.Variables["straikerSessionId"];
+        var user = (string)context.Variables["straikerUserName"];
+        JObject ev;
+        if (tr["tool_use_id"] != null) {
+            ev = new JObject {
+                ["hook_event_name"] = "PostToolUse",
+                ["session_id"] = sid,
+                ["user_name"] = user,
+                ["tool_name"] = (string)context.Variables["straikerToolResultName"],
+                ["tool_input"] = new JObject(),
+                ["tool_response"] = tr["content"],
+                ["tool_use_id"] = tr["tool_use_id"],
+                ["is_error"] = tr["is_error"]
+            };
+        } else {
+            ev = new JObject {
+                ["hook_event_name"] = "UserPromptSubmit",
+                ["session_id"] = sid,
+                ["user_name"] = user,
+                ["prompt"] = (string)context.Variables["straikerPrompt"]
+            };
+        }
+        ev["model"] = (string)context.Variables["straikerModel"];
+        return ev.ToString(Newtonsoft.Json.Formatting.None);
+    }" />
+
+    <!-- Nothing to score: not a coding agent, utility chatter, or an empty turn. -->
+    <set-variable name="straikerCodingSkip" value="@{
+        if (!(bool)context.Variables["straikerIsCoding"]) { return true; }
+        if ((bool)context.Variables["straikerIsUtility"]) { return true; }
+        if ((string)context.Variables["straikerCodingContract"] == "gateway") { return false; }
+        var tr = (JObject)context.Variables["straikerToolResult"];
+        if (tr["tool_use_id"] != null) { return false; }
+        return string.IsNullOrEmpty((string)context.Variables["straikerPrompt"]);
+    }" />
+
+    <choose>
+      <when condition="@((bool)context.Variables["straikerCodingSkip"])">
+        <!-- pass through unscored -->
+      </when>
+
+      <!-- ===== detect mode: ASYNC. Zero added latency, streaming preserved. ===== -->
+      <when condition="@((string)context.Variables["straikerCodingMode"] != "enforce")">
+        <send-one-way-request mode="new" timeout="5">
+          <set-url>@((string)context.Variables["straikerDetectUrl"])</set-url>
+          <set-method>POST</set-method>
+          <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["straikerCodingKey"])</value>
+          </set-header>
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-header name="x-tool" exists-action="override">
+            <value>@((string)context.Variables["straikerXTool"])</value>
+          </set-header>
+          <set-header name="Straiker-Debug" exists-action="override">
+            <value>TRUE</value>
+          </set-header>
+          <set-header name="x-claude-code-session-id" exists-action="override">
+            <value>@((string)context.Variables["straikerSessionId"])</value>
+          </set-header>
+          <set-header name="x-straiker-phase" exists-action="override">
+            <value>request</value>
+          </set-header>
+          <set-header name="x-straiker-model" exists-action="override">
+            <value>@((string)context.Variables["straikerModel"])</value>
+          </set-header>
+          <set-header name="x-straiker-user" exists-action="override">
+            <value>@((string)context.Variables["straikerUserName"])</value>
+          </set-header>
+          <set-body>@((string)context.Variables["straikerEventBody"])</set-body>
+        </send-one-way-request>
+      </when>
+
+      <!-- ===== enforce mode: SYNCHRONOUS. Blocks before the model is called. ===== -->
+      <otherwise>
+        <!-- The outbound fragment needs an unencoded response to parse. -->
+        <set-header name="Accept-Encoding" exists-action="override">
+          <value>identity</value>
+        </set-header>
+        <send-request mode="new" response-variable-name="straikerCodingResp"
+                      timeout="@((int)context.Variables["straikerTimeoutSec"])" ignore-error="true">
+          <set-url>@((string)context.Variables["straikerDetectUrl"])</set-url>
+          <set-method>POST</set-method>
+          <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["straikerCodingKey"])</value>
+          </set-header>
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-header name="x-tool" exists-action="override">
+            <value>@((string)context.Variables["straikerXTool"])</value>
+          </set-header>
+          <set-header name="Straiker-Debug" exists-action="override">
+            <value>TRUE</value>
+          </set-header>
+          <set-header name="x-claude-code-session-id" exists-action="override">
+            <value>@((string)context.Variables["straikerSessionId"])</value>
+          </set-header>
+          <set-header name="x-straiker-phase" exists-action="override">
+            <value>request</value>
+          </set-header>
+          <set-header name="x-straiker-model" exists-action="override">
+            <value>@((string)context.Variables["straikerModel"])</value>
+          </set-header>
+          <set-header name="x-straiker-user" exists-action="override">
+            <value>@((string)context.Variables["straikerUserName"])</value>
+          </set-header>
+          <set-body>@((string)context.Variables["straikerEventBody"])</set-body>
+        </send-request>
+
+        <!-- Verdict. Both contracts are supported: the hook path answers with a
+             top-level action (and hookSpecificOutput.permissionDecision when a
+             policy is configured); the gateway path answers with
+             hookSpecificOutput.permissionDecision. Treat either as a block. -->
+        <set-variable name="straikerCodingBlocked" value="@{
+            var r = context.Variables.GetValueOrDefault<IResponse>("straikerCodingResp", null);
+            if (r == null || r.StatusCode != 200) { return false; }
+            try {
+                var body = r.Body.As<JObject>(preserveContent: true);
+                var decision = (string)(body["hookSpecificOutput"]?["permissionDecision"] ?? "");
+                if (string.Equals(decision, "deny", StringComparison.OrdinalIgnoreCase)) { return true; }
+                var action = (string)(body["action"] ?? "");
+                return string.Equals(action, "block", StringComparison.OrdinalIgnoreCase);
+            } catch { return false; }
+        }" />
+        <set-variable name="straikerCodingReason" value="@{
+            var r = context.Variables.GetValueOrDefault<IResponse>("straikerCodingResp", null);
+            if (r == null || r.StatusCode != 200) { return ""; }
+            try {
+                var body = r.Body.As<JObject>(preserveContent: true);
+                var reason = (string)(body["hookSpecificOutput"]?["permissionDecisionReason"]
+                                      ?? body["stopReason"] ?? body["reason"] ?? "");
+                return string.IsNullOrEmpty(reason) ? "Request blocked by Straiker guardrails." : reason;
+            } catch { return "Request blocked by Straiker guardrails."; }
+        }" />
+
+        <choose>
+          <when condition="@((bool)context.Variables["straikerCodingBlocked"]
+                          && (string)context.Variables["straikerBlockMode"] == "http-403")">
+            <return-response>
+              <set-status code="403" reason="Forbidden" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@{
+                  var err = new JObject { ["error"] = new JObject {
+                      ["type"] = "straiker_policy_violation",
+                      ["message"] = (string)context.Variables["straikerCodingReason"] } };
+                  return err.ToString(Newtonsoft.Json.Formatting.None);
+              }</set-body>
+            </return-response>
+          </when>
+          <when condition="@((bool)context.Variables["straikerCodingBlocked"])">
+            <!-- Synthesize a well-formed Anthropic message so the coding agent
+                 renders the block and ends the turn cleanly (Kong parity). -->
+            <return-response>
+              <set-status code="200" reason="OK" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="x-straiker-verdict" exists-action="override">
+                <value>block</value>
+              </set-header>
+              <set-body>@{
+                  var stub = new JObject {
+                      ["id"] = "msg_straiker_blocked",
+                      ["type"] = "message",
+                      ["role"] = "assistant",
+                      ["model"] = (string)context.Variables["straikerModel"],
+                      ["content"] = new JArray { new JObject {
+                          ["type"] = "text",
+                          ["text"] = "⛔ Blocked by Straiker policy: " + (string)context.Variables["straikerCodingReason"] } },
+                      ["stop_reason"] = "end_turn",
+                      ["stop_sequence"] = null,
+                      ["usage"] = new JObject { ["input_tokens"] = 0, ["output_tokens"] = 0 }
+                  };
+                  return stub.ToString(Newtonsoft.Json.Formatting.None);
+              }</set-body>
+            </return-response>
+          </when>
+        </choose>
+      </otherwise>
+    </choose>
+</fragment>

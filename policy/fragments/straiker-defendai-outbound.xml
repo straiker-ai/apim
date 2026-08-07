@@ -1,0 +1,235 @@
+<!--
+  Straiker DefendAI - Outbound (post-call) detection.
+
+  Drop-in APIM Policy Fragment. Apply via:
+    <outbound>
+      <base />
+      <include-fragment fragment-id="straiker-defendai-outbound" />
+    </outbound>
+
+  Behaviour:
+    - Buffers the upstream LLM response, calls /detect[?agentic] with prompt + assistant content
+    - When straikerBlockOnPostCall = true AND score > threshold: replaces the
+      response with HTTP 403 + turn_id (output blocking). Use this for output
+      gating (PII / Data Exfil / System Prompt Leak detected on the assistant
+      content itself, not the user prompt).
+    - When straikerBlockOnPostCall = false (default): observability only.
+    - Skips on agent-loop iterations whose response has tool_calls
+    - Skips on streaming responses (SSE bodies aren't JSON-parseable)
+
+  Reads context.Variables set by the inbound fragment: straikerPrompt,
+  straikerAgentic, straikerSource, straikerDestination, straikerApiKey, straikerDetectUrl,
+  straikerReqBody, straikerIsStreaming, straikerBlocked, straikerMode, straikerThreshold.
+  Optional knob: straikerBlockOnPostCall (bool, default false).
+-->
+<fragment>
+    <!-- straikerBlockOnPostCall (bool, default false): when true, replace the
+         upstream response with 403 if the response itself scores over threshold
+         (output gating). Type-normalized so a string override works. -->
+    <set-variable name="straikerBlockOnPostCall" value="@{ var v = context.Variables.ContainsKey("straikerBlockOnPostCall") ? context.Variables["straikerBlockOnPostCall"] : null; if (v is bool b) { return b; } return string.Equals(Convert.ToString(v), "true", StringComparison.OrdinalIgnoreCase); }" />
+
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables.GetValueOrDefault<string>("straikerPrompt", ""))
+                       || context.Variables.GetValueOrDefault<bool>("straikerBlocked", false)
+                       || context.Variables.GetValueOrDefault<bool>("straikerIsStreaming", false)
+                       || (string)context.Variables.GetValueOrDefault<string>("straikerMode", "both") == "pre_call")">
+        <!-- skip post-call -->
+      </when>
+      <otherwise>
+        <set-variable name="straikerRespBody" value="@{
+            try { return context.Response.Body.As<JObject>(preserveContent: true); }
+            catch { return new JObject(); }
+        }" />
+        <set-variable name="straikerAppResponse" value="@{
+            var r = (JObject)context.Variables["straikerRespBody"];
+            var msg = r["choices"]?[0]?["message"];
+            return msg?["content"]?.Type == JTokenType.String ? (string)msg["content"] : "";
+        }" />
+        <set-variable name="straikerHasToolCalls" value="@{
+            var r = (JObject)context.Variables["straikerRespBody"];
+            var msg = r["choices"]?[0]?["message"];
+            return msg?["tool_calls"] is JArray a && a.Count > 0;
+        }" />
+
+        <choose>
+          <when condition="@((bool)context.Variables["straikerAgentic"]
+                           && (bool)context.Variables["straikerHasToolCalls"])">
+            <!-- intermediate agent iteration; skip post-call -->
+          </when>
+          <when condition="@(string.IsNullOrEmpty((string)context.Variables["straikerAppResponse"]))">
+            <!-- empty response; nothing to score -->
+          </when>
+          <otherwise>
+            <send-request mode="new" response-variable-name="straikerPostResp"
+                          timeout="5" ignore-error="true">
+              <set-url>@(((bool)context.Variables["straikerAgentic"])
+                         ? ((string)context.Variables["straikerDetectUrl"])
+                           + (((string)context.Variables["straikerDetectUrl"]).Contains("?") ? "&agentic" : "?agentic")
+                         : (string)context.Variables["straikerDetectUrl"])</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["straikerApiKey"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@{
+                  var b    = (JObject)context.Variables["straikerReqBody"];
+                  var hdrs = context.Request.Headers;
+
+                  var sessionId = hdrs.GetValueOrDefault("x-session-id", context.RequestId.ToString());
+                  var userName  = hdrs.GetValueOrDefault("x-user-name", "");
+                  if (string.IsNullOrEmpty(userName)) {
+                      userName = (b["user"] != null && b["user"].Type == JTokenType.String) ? (string)b["user"] : "apim";
+                  }
+                  var userRole  = hdrs.GetValueOrDefault("x-user-role", "public");
+                  var traceId   = hdrs.GetValueOrDefault("x-trace-id", "");
+                  var agentRole = hdrs.GetValueOrDefault("x-agent-role", "");
+                  var ip        = context.Request.IpAddress ?? "127.0.0.1";
+                  var ua        = hdrs.GetValueOrDefault("user-agent", "apim");
+                  var model     = (b["model"] != null && b["model"].Type == JTokenType.String) ? (string)b["model"] : "unknown";
+                  var appResp   = (string)context.Variables["straikerAppResponse"];
+
+                  var network = new JObject {
+                      ["IP"] = ip, ["User-Agent"] = ua, ["Content-Type"] = "application/json"
+                  };
+                  var metadata = new JObject {
+                      ["session_id"] = sessionId, ["user_name"] = userName, ["user_role"] = userRole,
+                      ["remote_ip"]  = ip, ["app_name"] = (string)context.Variables["straikerSource"],
+                      ["source"]     = "apim-policy", ["trace_id"] = traceId, ["agent_role"] = agentRole
+                  };
+                  var annotations = new JObject {
+                      ["source"] = "apim-policy", ["model"] = model, ["hook"] = "post_call",
+                      ["trace_id"] = traceId, ["agent_role"] = agentRole
+                  };
+
+                  JObject payload;
+                  if ((bool)context.Variables["straikerAgentic"]) {
+                      var outMsgs = new JArray();
+                      var inMsgs  = b["messages"] as JArray;
+                      if (inMsgs != null) {
+                          foreach (var raw in inMsgs) {
+                              var m = raw as JObject;
+                              if (m == null) { continue; }
+                              var entry = new JObject { ["role"] = m["role"] };
+                              var c = m["content"]; string text = null;
+                              if (c?.Type == JTokenType.String) { text = (string)c; }
+                              else if (c?.Type == JTokenType.Array) {
+                                  foreach (var p in (JArray)c) {
+                                      if ((string)p["type"] == "text") { text = (string)p["text"]; break; }
+                                  }
+                              }
+                              if (!string.IsNullOrEmpty(text)) { entry["content"] = text; }
+                              if (m["tool_calls"] is JArray tcs) {
+                                  var outTcs = new JArray();
+                                  foreach (var raw2 in tcs) {
+                                      var tc = raw2 as JObject;
+                                      if (tc == null) { continue; }
+                                      var item = new JObject { ["id"] = tc["id"] };
+                                      var fn = tc["function"] as JObject ?? tc["func"] as JObject;
+                                      if (fn != null) {
+                                          item["name"] = fn["name"];
+                                          var args = fn["arguments"];
+                                          if (args?.Type == JTokenType.String) {
+                                              try { item["input"] = JToken.Parse((string)args); }
+                                              catch { item["input"] = new JObject { ["_raw"] = (string)args }; }
+                                          } else if (args?.Type == JTokenType.Object) {
+                                              item["input"] = args;
+                                          }
+                                      } else {
+                                          item["name"]  = tc["name"];
+                                          item["input"] = tc["input"];
+                                      }
+                                      outTcs.Add(item);
+                                  }
+                                  entry["tool_calls"] = outTcs;
+                              }
+                              if (m["tool_call_id"] != null) { entry["tool_call_id"] = m["tool_call_id"]; }
+                              if (m["name"] != null)        { entry["tool_name"]    = m["name"]; }
+                              else if (m["tool_name"] != null) { entry["tool_name"] = m["tool_name"]; }
+                              outMsgs.Add(entry);
+                          }
+                      }
+                      if (!string.IsNullOrEmpty(appResp)) {
+                          outMsgs.Add(new JObject {
+                              ["role"] = "assistant",
+                              ["content"] = appResp
+                          });
+                      }
+                      payload = new JObject {
+                          ["source"]      = (string)context.Variables["straikerSource"],
+                          ["destination"] = (string)context.Variables["straikerDestination"],
+                          ["messages"]    = outMsgs,
+                          ["session_id"]  = sessionId,
+                          ["user_name"]   = userName,
+                          ["user_role"]   = userRole,
+                          ["metadata"]    = metadata,
+                          ["network"]     = network,
+                          ["annotations"] = annotations
+                      };
+                  } else {
+                      payload = new JObject {
+                          ["prompt"]       = (string)context.Variables["straikerPrompt"],
+                          ["app_response"] = appResp,
+                          ["rag_content"]  = "N/A",
+                          ["session_id"]   = sessionId,
+                          ["user_name"]    = userName,
+                          ["user_role"]    = userRole,
+                          ["metadata"]     = metadata,
+                          ["network"]      = network,
+                          ["annotations"]  = annotations
+                      };
+                  }
+                  return payload.ToString(Newtonsoft.Json.Formatting.None);
+              }</set-body>
+            </send-request>
+
+            <!-- Post-call blocking: when enabled and Straiker scored the
+                 response > threshold, replace the upstream response with
+                 HTTP 403. Defaults to off so existing customers keep
+                 observability-only behaviour. -->
+            <choose>
+              <when condition="@((bool)context.Variables["straikerBlockOnPostCall"])">
+                <set-variable name="straikerPostScore" value="@{
+                    var r = context.Variables.GetValueOrDefault<IResponse>("straikerPostResp", null);
+                    if (r == null || r.StatusCode != 200) { return 0.0; }
+                    try {
+                        var s = r.Body.As<JObject>(preserveContent: true)["score"];
+                        return (s != null && (s.Type == JTokenType.Float || s.Type == JTokenType.Integer)) ? (double)s : 0.0;
+                    } catch { return 0.0; }
+                }" />
+                <set-variable name="straikerPostTurnId" value="@{
+                    var r = context.Variables.GetValueOrDefault<IResponse>("straikerPostResp", null);
+                    if (r == null || r.StatusCode != 200) { return ""; }
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    return (string)(body["turn_id"] ?? body["turnId"] ?? "");
+                }" />
+                <choose>
+                  <when condition="@((double)context.Variables["straikerPostScore"] > (double)context.Variables.GetValueOrDefault<double>("straikerThreshold", 0.5))">
+                    <return-response>
+                      <set-status code="403" reason="Forbidden" />
+                      <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                      </set-header>
+                      <set-body>@{
+                          var err = new JObject {
+                              ["error"] = new JObject {
+                                  ["message"] = "Straiker: threat detected in response (post-call). Final output blocked before reaching user.",
+                                  ["score"]   = (double)context.Variables["straikerPostScore"],
+                                  ["turn_id"] = (string)context.Variables["straikerPostTurnId"],
+                                  ["phase"]   = "post_call",
+                                  ["code"]    = "403"
+                              }
+                          };
+                          return err.ToString(Newtonsoft.Json.Formatting.None);
+                      }</set-body>
+                    </return-response>
+                  </when>
+                </choose>
+              </when>
+            </choose>
+          </otherwise>
+        </choose>
+      </otherwise>
+    </choose>
+</fragment>

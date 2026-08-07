@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "apimName":       { "value": "my-apim-instance" },
+    "targetApiName":  { "value": "openai-protected" },
+    "createTestApi":  { "value": true },
+    "testBackendUrl": { "value": "https://api.openai.com" }
+  }
+}

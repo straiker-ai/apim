@@ -1,0 +1,221 @@
+<!--
+  Straiker - Coding agent (Claude Code) OUTBOUND enforcement.
+
+  Companion to straiker-coding-inbound. Scores the tool call the model just
+  emitted (PreToolUse) BEFORE the coding agent executes it - this is the only
+  point where a destructive command (rm -rf, curl | sh, base64 -> bash,
+  reverse shell, credential exfil) can be stopped preventively.
+
+  Apply via:
+    <outbound>
+      <base />
+      <include-fragment fragment-id="straiker-coding-outbound" />
+    </outbound>
+
+  ONLY RUNS IN enforce MODE. In detect mode the inbound fragment already posted
+  asynchronously and the response streams to the client untouched - this
+  fragment deliberately does nothing, because holding the response to score it
+  is exactly what breaks streaming.
+
+  Reads variables set by the inbound fragment (straikerCodingMode,
+  straikerCodingKey, straikerSessionId, straikerModel, ...).
+-->
+<fragment>
+    <choose>
+      <when condition="@((string)context.Variables.GetValueOrDefault<string>("straikerCodingMode", "detect") != "enforce"
+                       || context.Variables.GetValueOrDefault<bool>("straikerCodingSkip", true))">
+        <!-- detect mode (async) or nothing to score: leave the response alone -->
+      </when>
+      <otherwise>
+        <set-variable name="straikerRespRaw" value="@{
+            try { return context.Response.Body.As<string>(preserveContent: true) ?? ""; } catch { return ""; }
+        }" />
+        <set-variable name="straikerRespBody" value="@{
+            try { return JObject.Parse((string)context.Variables["straikerRespRaw"]); } catch { return new JObject(); }
+        }" />
+
+        <!-- The tool call the model wants to run. Anthropic non-streaming shape:
+             content[] carries a tool_use block. (A streamed SSE response cannot
+             be parsed here - see the streaming note in the README; enforce mode
+             expects stream:false on the guarded route.) -->
+        <set-variable name="straikerToolUse" value="@{
+            var r = (JObject)context.Variables["straikerRespBody"];
+            var content = r["content"] as JArray;
+            var found = new JObject();
+            if (content == null) { return found; }
+            foreach (var part in content) {
+                if ((string)part["type"] != "tool_use") { continue; }
+                found["id"] = part["id"];
+                found["name"] = part["name"];
+                found["input"] = part["input"];
+                return found;
+            }
+            return found;
+        }" />
+        <!-- Assistant's final text, for the Stop event (monitor-only). -->
+        <set-variable name="straikerAssistantText" value="@{
+            var r = (JObject)context.Variables["straikerRespBody"];
+            var content = r["content"] as JArray;
+            if (content == null) { return ""; }
+            foreach (var part in content) {
+                if ((string)part["type"] == "text") { return (string)part["text"]; }
+            }
+            return "";
+        }" />
+
+        <choose>
+          <when condition="@(((JObject)context.Variables["straikerToolUse"])["id"] == null)">
+            <!-- No tool call: nothing preventable. Post Stop asynchronously for
+                 the Console transcript, never block a real answer. -->
+            <choose>
+              <when condition="@(!string.IsNullOrEmpty((string)context.Variables["straikerAssistantText"]))">
+                <send-one-way-request mode="new" timeout="5">
+                  <set-url>@((string)context.Variables["straikerDetectUrl"])</set-url>
+                  <set-method>POST</set-method>
+                  <set-header name="Authorization" exists-action="override">
+                    <value>@("Bearer " + (string)context.Variables["straikerCodingKey"])</value>
+                  </set-header>
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-header name="x-tool" exists-action="override">
+                    <value>@((string)context.Variables["straikerXTool"])</value>
+                  </set-header>
+                  <set-header name="Straiker-Debug" exists-action="override">
+                    <value>TRUE</value>
+                  </set-header>
+                  <set-header name="x-claude-code-session-id" exists-action="override">
+                    <value>@((string)context.Variables["straikerSessionId"])</value>
+                  </set-header>
+                  <set-header name="x-straiker-phase" exists-action="override">
+                    <value>response</value>
+                  </set-header>
+                  <set-body>@{
+                      var ev = new JObject {
+                          ["hook_event_name"] = "Stop",
+                          ["session_id"] = (string)context.Variables["straikerSessionId"],
+                          ["user_name"] = (string)context.Variables["straikerUserName"],
+                          ["app_response"] = (string)context.Variables["straikerAssistantText"],
+                          ["stop_reason"] = "end_turn",
+                          ["model"] = (string)context.Variables["straikerModel"]
+                      };
+                      return ev.ToString(Newtonsoft.Json.Formatting.None);
+                  }</set-body>
+                </send-one-way-request>
+              </when>
+            </choose>
+          </when>
+
+          <otherwise>
+            <!-- Score the pending tool call and WAIT: the whole point is to
+                 answer before the agent runs the command. -->
+            <send-request mode="new" response-variable-name="straikerPreToolResp"
+                          timeout="@((int)context.Variables.GetValueOrDefault<int>("straikerTimeoutSec", 5))"
+                          ignore-error="true">
+              <set-url>@((string)context.Variables["straikerDetectUrl"])</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["straikerCodingKey"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="x-tool" exists-action="override">
+                <value>@((string)context.Variables["straikerXTool"])</value>
+              </set-header>
+              <set-header name="Straiker-Debug" exists-action="override">
+                <value>TRUE</value>
+              </set-header>
+              <set-header name="x-claude-code-session-id" exists-action="override">
+                <value>@((string)context.Variables["straikerSessionId"])</value>
+              </set-header>
+              <!-- response-sync = the buffered, preventive phase -->
+              <set-header name="x-straiker-phase" exists-action="override">
+                <value>response-sync</value>
+              </set-header>
+              <set-header name="x-straiker-model" exists-action="override">
+                <value>@((string)context.Variables["straikerModel"])</value>
+              </set-header>
+              <set-body>@{
+                  var tu = (JObject)context.Variables["straikerToolUse"];
+                  var name = (string)(tu["name"] ?? "");
+                  var ev = new JObject {
+                      ["hook_event_name"] = "PreToolUse",
+                      ["session_id"] = (string)context.Variables["straikerSessionId"],
+                      ["user_name"] = (string)context.Variables["straikerUserName"],
+                      ["tool_name"] = name,
+                      ["tool_input"] = tu["input"] ?? new JObject(),
+                      ["tool_use_id"] = tu["id"],
+                      ["model"] = (string)context.Variables["straikerModel"]
+                  };
+                  // Surface MCP tools the way the native hooks do: mcp__server__tool
+                  if (name.StartsWith("mcp__")) {
+                      var bits = name.Split(new string[] { "__" }, StringSplitOptions.None);
+                      if (bits.Length >= 3) {
+                          ev["mcp_server_name"] = bits[1];
+                          ev["mcp_tool_name"] = bits[2];
+                      }
+                  }
+                  return ev.ToString(Newtonsoft.Json.Formatting.None);
+              }</set-body>
+            </send-request>
+
+            <set-variable name="straikerToolBlocked" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerPreToolResp", null);
+                if (r == null || r.StatusCode != 200) { return false; }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    var decision = (string)(body["hookSpecificOutput"]?["permissionDecision"] ?? "");
+                    if (string.Equals(decision, "deny", StringComparison.OrdinalIgnoreCase)) { return true; }
+                    var action = (string)(body["action"] ?? "");
+                    return string.Equals(action, "block", StringComparison.OrdinalIgnoreCase);
+                } catch { return false; }
+            }" />
+            <set-variable name="straikerToolReason" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerPreToolResp", null);
+                if (r == null || r.StatusCode != 200) { return "Tool call blocked by Straiker guardrails."; }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    var reason = (string)(body["hookSpecificOutput"]?["permissionDecisionReason"]
+                                          ?? body["stopReason"] ?? body["reason"] ?? "");
+                    return string.IsNullOrEmpty(reason) ? "Tool call blocked by Straiker guardrails." : reason;
+                } catch { return "Tool call blocked by Straiker guardrails."; }
+            }" />
+
+            <choose>
+              <when condition="@((bool)context.Variables["straikerToolBlocked"])">
+                <!-- Discard the real response (which carries the tool_use the
+                     agent would execute) and hand back a clean refusal instead:
+                     no tool_use block exists in what the client receives, so
+                     there is nothing to run. -->
+                <return-response>
+                  <set-status code="200" reason="OK" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-header name="x-straiker-verdict" exists-action="override">
+                    <value>block</value>
+                  </set-header>
+                  <set-body>@{
+                      var stub = new JObject {
+                          ["id"] = "msg_straiker_blocked",
+                          ["type"] = "message",
+                          ["role"] = "assistant",
+                          ["model"] = (string)context.Variables["straikerModel"],
+                          ["content"] = new JArray { new JObject {
+                              ["type"] = "text",
+                              ["text"] = "⛔ Blocked by Straiker policy: " + (string)context.Variables["straikerToolReason"] } },
+                          ["stop_reason"] = "end_turn",
+                          ["stop_sequence"] = null,
+                          ["usage"] = new JObject { ["input_tokens"] = 0, ["output_tokens"] = 0 }
+                      };
+                      return stub.ToString(Newtonsoft.Json.Formatting.None);
+                  }</set-body>
+                </return-response>
+              </when>
+            </choose>
+          </otherwise>
+        </choose>
+      </otherwise>
+    </choose>
+</fragment>

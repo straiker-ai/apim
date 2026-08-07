@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+*.egg-info/
+.idea/
+.vscode/
+
+# Local-only files containing keys / instance names — never commit
+LOCAL_KEYS.md
+LOCAL_*.md
+*.local.md
+local-*
+.github/workflows/
