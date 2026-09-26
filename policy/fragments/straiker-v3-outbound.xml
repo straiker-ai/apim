@@ -1,0 +1,470 @@
+<!--
+  Straiker v3 platform - OUTBOUND (response phase) for Azure API Management.
+
+  Companion to straiker-v3-inbound. Posts the model's answer to
+  POST /api/v3/detect in the response-sync envelope the Kong plugin and the
+  LiteLLM guardrail use:
+
+    { "straiker_phase": "response-sync", "sse": "<answer>", "model": "...",
+      "request": { ...the relayed request body... }, "session_id": "...",
+      "original": { "processed": { "Meta": { "user": "..." } } } }
+
+  `sse` is the upstream body verbatim for JSON answers and for Anthropic SSE.
+  An OpenAI chat.completion.chunk stream is reassembled into one
+  chat.completion object first, because the platform does not read that
+  stream format (measured 2026-09-26: SSN in a chunked answer was not
+  scored). A Responses stream is reduced to its response.completed object.
+
+  straikerResponsePhase (set on inbound):
+    sync   waits for the verdict; a denied answer / tool call is replaced by
+           the block stub before the client sees it. Reading the body here is
+           what makes APIM buffer the response, so token-by-token streaming
+           is lost on this route (the standard tradeoff, same as Kong buffered
+           mode and LiteLLM).
+    async  fire-and-forget, advisory (recorded, never blocks).
+    off    nothing.
+
+  Always sets x-straiker-verdict (allow | detect | block | degraded | unknown)
+  and x-straiker-detail (turn_id, or why the verdict is degraded/unknown).
+-->
+<fragment>
+    <set-variable name="straikerV3RespStatus" value="@(context.Response.StatusCode)" />
+    <set-variable name="straikerV3RespSkip" value="@{
+        if (!context.Variables.ContainsKey("straikerV3Verdict")) { return "inbound-missing"; }
+        var phase = context.Variables.GetValueOrDefault<string>("straikerResponsePhase", "sync");
+        if (phase == "off") { return "phase-off"; }
+        if (!context.Variables.GetValueOrDefault<bool>("straikerScoreResponse", true)) { return "score_response=false"; }
+        if (!string.IsNullOrEmpty(context.Variables.GetValueOrDefault<string>("straikerV3SkipReason", ""))) { return (string)context.Variables["straikerV3SkipReason"]; }
+        if (context.Variables.GetValueOrDefault<bool>("straikerV3Oversize", false)) { return "oversize"; }
+        if (context.Variables.GetValueOrDefault<bool>("straikerV3Unscannable", false)) { return "unparseable"; }
+        // A Foundry Agent message-create was scored on the request phase; its POST response just echoes the
+        // stored message and is not a model answer, so there is nothing to score here.
+        if (context.Variables.GetValueOrDefault<string>("straikerV3Shape", "").StartsWith("assistant.")) { return "agent-service"; }
+        var st = (int)context.Variables["straikerV3RespStatus"];
+        if (st < 200 || st > 299) { return "upstream-" + st; }
+        return "";
+    }" />
+
+    <choose>
+      <when condition="@(!string.IsNullOrEmpty((string)context.Variables["straikerV3RespSkip"]))">
+        <set-header name="x-straiker-verdict" exists-action="override">
+          <value>@(context.Variables.GetValueOrDefault<string>("straikerV3Verdict", "unknown"))</value>
+        </set-header>
+        <set-header name="x-straiker-detail" exists-action="override">
+          <value>@(context.Variables.GetValueOrDefault<string>("straikerV3Detail", "") + ";response=" + (string)context.Variables["straikerV3RespSkip"])</value>
+        </set-header>
+      </when>
+      <otherwise>
+        <set-variable name="straikerV3RespRaw" value="@{
+            try { return context.Response.Body?.As<string>(preserveContent: true) ?? ""; } catch { return ""; }
+        }" />
+        <set-variable name="straikerV3RespIsSse" value="@{
+            var ct = context.Response.Headers.GetValueOrDefault("Content-Type", "");
+            if (ct.StartsWith("text/event-stream", StringComparison.OrdinalIgnoreCase)) { return true; }
+            return ((string)context.Variables["straikerV3RespRaw"]).TrimStart().StartsWith("data:") || ((string)context.Variables["straikerV3RespRaw"]).TrimStart().StartsWith("event:");
+        }" />
+        <!-- The answer as the platform can read it. -->
+        <set-variable name="straikerV3Sse" value="@{
+            var raw = (string)context.Variables["straikerV3RespRaw"];
+            var shape = (string)context.Variables["straikerV3Shape"];
+            if (shape == "openai.completion") {
+                // The request was relayed as messages (autonomous_agent), so present the text_completion
+                // answer (JSON or stream) as the matching chat.completion.
+                var ctext = new System.Text.StringBuilder(); string cid = null, cmodel = null, cfin = null;
+                var docs = new List<JObject>();
+                if ((bool)context.Variables["straikerV3RespIsSse"]) {
+                    foreach (var line in raw.Split('\n')) {
+                        var l = line.Trim();
+                        if (!l.StartsWith("data:")) { continue; }
+                        var d = l.Substring(5).Trim();
+                        if (d == "[DONE]" || d.Length == 0) { continue; }
+                        try { docs.Add(JObject.Parse(d)); } catch { }
+                    }
+                } else {
+                    try { docs.Add(JObject.Parse(raw)); } catch { return raw; }
+                }
+                foreach (var ev in docs) {
+                    if (string.IsNullOrEmpty(cid) && ev["id"] != null) { cid = (string)ev["id"]; }
+                    if (string.IsNullOrEmpty(cmodel) && ev["model"] != null) { cmodel = (string)ev["model"]; }
+                    var chs = ev["choices"] as JArray;
+                    if (chs == null) { continue; }
+                    foreach (var ch in chs) {
+                        var t = ch["text"]; if (t != null && t.Type == JTokenType.String) { ctext.Append((string)t); }
+                        var fr = ch["finish_reason"]; if (fr != null && fr.Type == JTokenType.String) { cfin = (string)fr; }
+                    }
+                }
+                return new JObject {
+                    ["id"] = string.IsNullOrEmpty(cid) ? "chatcmpl-apim-completion" : cid, ["object"] = "chat.completion",
+                    ["model"] = string.IsNullOrEmpty(cmodel) ? "unknown" : cmodel,
+                    ["choices"] = new JArray { new JObject { ["index"] = 0, ["message"] = new JObject { ["role"] = "assistant", ["content"] = ctext.ToString() }, ["finish_reason"] = cfin ?? "stop" } }
+                }.ToString(Newtonsoft.Json.Formatting.None);
+            }
+            if (!(bool)context.Variables["straikerV3RespIsSse"]) { return raw; }
+            if (shape == "anthropic.messages") { return raw; }
+            var n = Newtonsoft.Json.Formatting.None;
+            if (shape == "openai.responses") {
+                string lastData = null; bool completedNext = false;
+                foreach (var line in raw.Split('\n')) {
+                    var l = line.TrimEnd('\r');
+                    if (l.StartsWith("event:")) { completedNext = l.Substring(6).Trim() == "response.completed"; continue; }
+                    if (!l.StartsWith("data:")) { continue; }
+                    var d = l.Substring(5).Trim();
+                    if (d == "[DONE]" || d.Length == 0) { continue; }
+                    if (completedNext) { lastData = d; completedNext = false; }
+                }
+                if (lastData == null) { return raw; }
+                try { var ev = JObject.Parse(lastData); var r = ev["response"] as JObject; return r != null ? r.ToString(n) : raw; } catch { return raw; }
+            }
+            if (shape != "openai.chat") { return raw; }
+            var sb = new System.Text.StringBuilder();
+            var toolCalls = new JObject();
+            string finish = null, model = null, id = null;
+            foreach (var line in raw.Split('\n')) {
+                var l = line.Trim();
+                if (!l.StartsWith("data:")) { continue; }
+                var payload = l.Substring(5).Trim();
+                if (payload == "[DONE]" || payload.Length == 0) { continue; }
+                JObject ev;
+                try { ev = JObject.Parse(payload); } catch { continue; }
+                // Azure OpenAI's first chunk carries empty id/model (prompt_filter_results); take the first non-empty values.
+                if (string.IsNullOrEmpty(id) && ev["id"] != null && ev["id"].Type == JTokenType.String) { id = (string)ev["id"]; }
+                if (string.IsNullOrEmpty(model) && ev["model"] != null && ev["model"].Type == JTokenType.String) { model = (string)ev["model"]; }
+                var choices = ev["choices"] as JArray;
+                if (choices == null) { continue; }
+                foreach (var ch in choices) {
+                    var delta = ch["delta"] as JObject;
+                    if (delta != null) {
+                        var c = delta["content"];
+                        if (c != null && c.Type == JTokenType.String) { sb.Append((string)c); }
+                        var tcs = delta["tool_calls"] as JArray;
+                        if (tcs != null) {
+                            foreach (var tc in tcs) {
+                                var idx = (tc["index"] ?? 0).ToString();
+                                var cur = toolCalls[idx] as JObject;
+                                if (cur == null) {
+                                    cur = new JObject { ["id"] = tc["id"], ["type"] = "function", ["function"] = new JObject { ["name"] = (string)(tc["function"]?["name"] ?? ""), ["arguments"] = "" } };
+                                    toolCalls[idx] = cur;
+                                }
+                                if (cur["id"] == null || cur["id"].Type == JTokenType.Null) { if (tc["id"] != null) { cur["id"] = tc["id"]; } }
+                                var fn = tc["function"] as JObject;
+                                if (fn != null) {
+                                    var nm = fn["name"];
+                                    if (nm != null && nm.Type == JTokenType.String && string.IsNullOrEmpty((string)cur["function"]["name"])) { cur["function"]["name"] = (string)nm; }
+                                    var args = fn["arguments"];
+                                    if (args != null && args.Type == JTokenType.String) { cur["function"]["arguments"] = (string)cur["function"]["arguments"] + (string)args; }
+                                }
+                            }
+                        }
+                    }
+                    var fr = ch["finish_reason"];
+                    if (fr != null && fr.Type == JTokenType.String) { finish = (string)fr; }
+                }
+            }
+            var msg = new JObject { ["role"] = "assistant" };
+            msg["content"] = sb.Length > 0 ? (JToken)sb.ToString() : JValue.CreateNull();
+            if (toolCalls.Count > 0) { var arr = new JArray(); foreach (var p in toolCalls.Properties()) { arr.Add(p.Value); } msg["tool_calls"] = arr; }
+            var reqModel = (string)context.Variables["straikerV3Model"];
+            return new JObject {
+                ["id"] = string.IsNullOrEmpty(id) ? "chatcmpl-apim-reassembled" : id, ["object"] = "chat.completion",
+                ["model"] = !string.IsNullOrEmpty(model) ? model : (string.IsNullOrEmpty(reqModel) ? "unknown" : reqModel),
+                ["choices"] = new JArray { new JObject { ["index"] = 0, ["message"] = msg, ["finish_reason"] = finish ?? "stop" } }
+            }.ToString(n);
+        }" />
+        <!-- Model for the envelope: the request's, else the answer's (Azure OpenAI names the deployment in the URL, not the body), else unknown. -->
+        <set-variable name="straikerV3EnvModel" value="@{
+            var m = (string)context.Variables["straikerV3Model"];
+            if (!string.IsNullOrEmpty(m)) { return m; }
+            try {
+                var sse = (string)context.Variables["straikerV3Sse"];
+                if (sse.TrimStart().StartsWith("{")) { var j = JObject.Parse(sse); var jm = j["model"]; if (jm != null && jm.Type == JTokenType.String && !string.IsNullOrEmpty((string)jm)) { return (string)jm; } }
+            } catch { }
+            return "unknown";
+        }" />
+        <set-variable name="straikerV3RespEnvelope" value="@{
+            var phase = context.Variables.GetValueOrDefault<string>("straikerResponsePhase", "sync");
+            var env = new JObject {
+                ["straiker_phase"] = phase == "async" ? "response" : "response-sync",
+                ["sse"] = (string)context.Variables["straikerV3Sse"],
+                ["model"] = (string)context.Variables["straikerV3EnvModel"],
+                ["request"] = (JObject)context.Variables["straikerV3Request"]
+            };
+            var sid = (string)context.Variables["straikerV3Session"];
+            if (!string.IsNullOrEmpty(sid)) { env["session_id"] = sid; }
+            var user = (string)context.Variables["straikerV3User"];
+            if (!string.IsNullOrEmpty(user)) { env["original"] = new JObject { ["processed"] = new JObject { ["Meta"] = new JObject { ["user"] = user } } }; env["user_name"] = user; }
+            return env.ToString(Newtonsoft.Json.Formatting.None);
+        }" />
+
+        <choose>
+          <when condition="@(string.IsNullOrEmpty((string)context.Variables["straikerV3Sse"]))">
+            <!-- An enforce route that could not buffer the answer scored nothing;
+                 say so instead of letting a silent read failure look like allow. -->
+            <set-header name="x-straiker-verdict" exists-action="override">
+              <value>@((string)context.Variables["straikerV3Verdict"])</value>
+            </set-header>
+            <set-header name="x-straiker-detail" exists-action="override">
+              <value>@((string)context.Variables["straikerV3Detail"] + ";response=no-body")</value>
+            </set-header>
+          </when>
+
+          <!-- ===== async: advisory, never blocks ===== -->
+          <when condition="@(context.Variables.GetValueOrDefault<string>("straikerResponsePhase", "sync") == "async")">
+            <send-one-way-request mode="new" timeout="30">
+              <set-url>@((string)context.Variables["straikerDetectUrl"])</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["straikerApiKey"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="X-S6r-Ingress" exists-action="override">
+                <value>gw-azure-apim</value>
+              </set-header>
+              <set-header name="x-s6r-agent" exists-action="@(string.IsNullOrEmpty((string)context.Variables["straikerV3Agent"]) ? "delete" : "override")">
+                <value>@((string)context.Variables["straikerV3Agent"])</value>
+              </set-header>
+              <set-header name="x-s6r-client" exists-action="@(string.IsNullOrEmpty((string)context.Variables["straikerV3Client"]) ? "delete" : "override")">
+                <value>@((string)context.Variables["straikerV3Client"])</value>
+              </set-header>
+              <set-header name="x-s6r-format" exists-action="@(string.IsNullOrEmpty((string)context.Variables["straikerFormatHint"]) ? "delete" : "override")">
+                <value>@((string)context.Variables["straikerFormatHint"])</value>
+              </set-header>
+              <set-body>@((string)context.Variables["straikerV3RespEnvelope"])</set-body>
+            </send-one-way-request>
+            <set-header name="x-straiker-verdict" exists-action="override">
+              <value>@((string)context.Variables["straikerV3Verdict"])</value>
+            </set-header>
+            <set-header name="x-straiker-detail" exists-action="override">
+              <value>@((string)context.Variables["straikerV3Detail"] + ";response=async")</value>
+            </set-header>
+          </when>
+
+          <!-- ===== sync: wait for the verdict, replace a denied answer ===== -->
+          <otherwise>
+            <retry condition="@{
+                  var r = context.Variables.GetValueOrDefault<IResponse>("straikerV3RespResp", null);
+                  return r != null && (r.StatusCode == 502 || r.StatusCode == 503 || r.StatusCode == 504);
+                }" count="1" interval="1" first-fast-retry="true">
+              <send-request mode="new" response-variable-name="straikerV3RespResp"
+                            timeout="@(context.Variables.GetValueOrDefault<int>("straikerTimeoutSec", 30))" ignore-error="true">
+                <set-url>@((string)context.Variables["straikerDetectUrl"])</set-url>
+                <set-method>POST</set-method>
+                <set-header name="Authorization" exists-action="override">
+                  <value>@("Bearer " + (string)context.Variables["straikerApiKey"])</value>
+                </set-header>
+                <set-header name="Content-Type" exists-action="override">
+                  <value>application/json</value>
+                </set-header>
+                <set-header name="X-S6r-Ingress" exists-action="override">
+                  <value>gw-azure-apim</value>
+                </set-header>
+                <set-header name="x-s6r-agent" exists-action="@(string.IsNullOrEmpty((string)context.Variables["straikerV3Agent"]) ? "delete" : "override")">
+                  <value>@((string)context.Variables["straikerV3Agent"])</value>
+                </set-header>
+                <set-header name="x-s6r-client" exists-action="@(string.IsNullOrEmpty((string)context.Variables["straikerV3Client"]) ? "delete" : "override")">
+                  <value>@((string)context.Variables["straikerV3Client"])</value>
+                </set-header>
+                <set-header name="x-s6r-format" exists-action="@(string.IsNullOrEmpty((string)context.Variables["straikerFormatHint"]) ? "delete" : "override")">
+                  <value>@((string)context.Variables["straikerFormatHint"])</value>
+                </set-header>
+                <set-body>@((string)context.Variables["straikerV3RespEnvelope"])</set-body>
+              </send-request>
+            </retry>
+
+            <set-variable name="straikerV3RespVerdict" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerV3RespResp", null);
+                if (r == null || r.StatusCode != 200) { return "degraded"; }
+                JObject body;
+                try { body = r.Body.As<JObject>(preserveContent: true); } catch { return "degraded"; }
+                if (body == null) { return "degraded"; }
+                var st = body["straiker"] as JObject;
+                var decision = ((string)(body["hookSpecificOutput"]?["permissionDecision"] ?? "")).ToLowerInvariant();
+                if (string.IsNullOrEmpty(decision)) { decision = ((string)(body["action"] ?? st?["action"] ?? "")).ToLowerInvariant(); }
+                if (decision == "deny" || decision == "block") { return "block"; }
+                var bb = (body["blocked_by"] ?? st?["blocked_by"]) as JArray;
+                if (bb != null && bb.Count > 0) { return "block"; }
+                var action = ((string)(st?["action"] ?? body["action"] ?? "")).ToLowerInvariant();
+                return action == "detect" ? "detect" : "allow";
+            }" />
+            <set-variable name="straikerV3RespDetail" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerV3RespResp", null);
+                if (r == null) { return "unreachable"; }
+                if (r.StatusCode != 200) { return "http-" + r.StatusCode; }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    var st = body?["straiker"] as JObject;
+                    return (string)(st?["turn_id"] ?? body?["turn_id"] ?? "");
+                } catch { return "unparseable-verdict"; }
+            }" />
+            <set-variable name="straikerV3RespReason" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerV3RespResp", null);
+                if (r == null || r.StatusCode != 200) { return "Straiker is unreachable and this gateway is fail-closed."; }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    var st = body["straiker"] as JObject;
+                    var reason = (string)(body["stopReason"] ?? body["hookSpecificOutput"]?["permissionDecisionReason"] ?? st?["block_message"] ?? body["block_message"] ?? "");
+                    if (!string.IsNullOrEmpty(reason) && reason != "allow") { return reason; }
+                    var bb = (body["blocked_by"] ?? st?["blocked_by"]) as JArray;
+                    var names = bb != null && bb.Count > 0 ? string.Join(", ", bb.Select(x => (string)x)) : "policy";
+                    return "Blocked by Straiker policy (" + names + ").";
+                } catch { return "Blocked by Straiker policy."; }
+            }" />
+            <set-variable name="straikerV3RespBlockedBy" value="@{
+                var r = context.Variables.GetValueOrDefault<IResponse>("straikerV3RespResp", null);
+                if (r == null || r.StatusCode != 200) { return new JArray(); }
+                try {
+                    var body = r.Body.As<JObject>(preserveContent: true);
+                    var st = body["straiker"] as JObject;
+                    return (body["blocked_by"] ?? st?["blocked_by"]) as JArray ?? new JArray();
+                } catch { return new JArray(); }
+            }" />
+            <!-- Remember the block under the user turn that produced this answer,
+                 so the client's retry of the same conversation is re-blocked at the
+                 request phase without a second detect call. -->
+            <choose>
+              <when condition="@((string)context.Variables["straikerV3RespVerdict"] == "block"
+                              && ((JArray)context.Variables["straikerV3RespBlockedBy"]).Count > 0
+                              && !string.IsNullOrEmpty(context.Variables.GetValueOrDefault<string>("straikerV3ReplayScope", ""))
+                              && ((JArray)context.Variables["straikerV3UserDigests"]).Count > 0)">
+                <cache-store-value key="@((string)context.Variables["straikerV3ReplayScope"])" value="@{
+                    JArray list;
+                    try { list = JArray.Parse(context.Variables.GetValueOrDefault<string>("straikerV3BlockedList", "[]") ?? "[]"); } catch { list = new JArray(); }
+                    var digests = (JArray)context.Variables["straikerV3UserDigests"];
+                    var last = (string)digests[digests.Count - 1];
+                    bool present = false;
+                    foreach (var e in list) { if ((string)(e["d"] ?? "") == last) { present = true; break; } }
+                    if (!present) { list.Add(new JObject { ["d"] = last, ["r"] = (string)context.Variables["straikerV3RespReason"] }); }
+                    while (list.Count > 50) { list.RemoveAt(0); }
+                    return list.ToString(Newtonsoft.Json.Formatting.None);
+                }" duration="@(context.Variables.GetValueOrDefault<int>("straikerReplayTtlSec", 86400))" />
+              </when>
+            </choose>
+
+            <set-variable name="straikerV3RespDeny" value="@{
+                var v = (string)context.Variables["straikerV3RespVerdict"];
+                if (v == "block") { return true; }
+                return v == "degraded" && context.Variables.GetValueOrDefault<bool>("straikerFailClosed", false);
+            }" />
+            <!-- The response-phase verdict overrides the request-phase one when
+                 it is worse (block > degraded > detect > allow). -->
+            <set-variable name="straikerV3FinalVerdict" value="@{
+                var a = (string)context.Variables["straikerV3Verdict"];
+                var b = (string)context.Variables["straikerV3RespVerdict"];
+                var rank = new Dictionary<string, int> { { "block", 4 }, { "degraded", 3 }, { "detect", 2 }, { "allow", 1 }, { "unknown", 0 } };
+                int ra = rank.ContainsKey(a) ? rank[a] : 0, rb = rank.ContainsKey(b) ? rank[b] : 0;
+                return rb >= ra ? b : a;
+            }" />
+            <choose>
+              <when condition="@((bool)context.Variables["straikerV3RespDeny"] && ((string)context.Variables["straikerBlockMode"] == "http-403" || (string)context.Variables["straikerBlockMode"] == "http-400"))">
+                <return-response>
+                  <set-status code="@((string)context.Variables["straikerBlockMode"] == "http-403" ? 403 : 400)" reason="@((string)context.Variables["straikerBlockMode"] == "http-403" ? "Forbidden" : "Bad Request")" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-header name="x-straiker-verdict" exists-action="override">
+                    <value>@((string)context.Variables["straikerV3RespVerdict"])</value>
+                  </set-header>
+                  <set-header name="x-straiker-detail" exists-action="override">
+                    <value>@((string)context.Variables["straikerV3Detail"] + ";response=" + (string)context.Variables["straikerV3RespDetail"])</value>
+                  </set-header>
+                  <set-body>@(new JObject { ["error"] = new JObject { ["type"] = "straiker_policy_violation", ["message"] = (string)context.Variables["straikerV3RespReason"] } }.ToString(Newtonsoft.Json.Formatting.None))</set-body>
+                </return-response>
+              </when>
+              <when condition="@((bool)context.Variables["straikerV3RespDeny"])">
+                <set-variable name="straikerV3Reason" value="@((string)context.Variables["straikerV3RespReason"])" />
+                <return-response>
+                  <set-status code="200" reason="OK" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>@((bool)context.Variables["straikerV3Stream"] ? "text/event-stream" : "application/json")</value>
+                  </set-header>
+                  <set-header name="Cache-Control" exists-action="override">
+                    <value>no-cache</value>
+                  </set-header>
+                  <set-header name="x-straiker-verdict" exists-action="override">
+                    <value>@((string)context.Variables["straikerV3RespVerdict"])</value>
+                  </set-header>
+                  <set-header name="x-straiker-detail" exists-action="override">
+                    <value>@((string)context.Variables["straikerV3Detail"] + ";response=" + (string)context.Variables["straikerV3RespDetail"])</value>
+                  </set-header>
+                  <set-body>@{
+                      // ---- STRAIKER_V3_STUB_BEGIN (kept identical in straiker-v3-outbound.xml; CI diffs the two) ----
+                      var shape = (string)context.Variables["straikerV3Shape"];
+                      var stream = (bool)context.Variables["straikerV3Stream"];
+                      var model = (string)context.Variables["straikerV3Model"];
+                      if (string.IsNullOrEmpty(model)) { model = "unknown"; }
+                      var text = (string)context.Variables["straikerV3Reason"];
+                      var n = Newtonsoft.Json.Formatting.None;
+                      var created = (long)(context.Timestamp - new DateTime(1970, 1, 1)).TotalSeconds;
+                      if (shape == "anthropic.messages") {
+                          if (!stream) {
+                              return new JObject {
+                                  ["id"] = "msg_straiker_blocked", ["type"] = "message", ["role"] = "assistant", ["model"] = model,
+                                  ["content"] = new JArray { new JObject { ["type"] = "text", ["text"] = text } },
+                                  ["stop_reason"] = "end_turn", ["stop_sequence"] = null,
+                                  ["usage"] = new JObject { ["input_tokens"] = 0, ["output_tokens"] = 0 }
+                              }.ToString(n);
+                          }
+                          var start = new JObject { ["type"] = "message_start", ["message"] = new JObject {
+                              ["id"] = "msg_straiker_blocked", ["type"] = "message", ["role"] = "assistant", ["model"] = model,
+                              ["content"] = new JArray(), ["stop_reason"] = null, ["stop_sequence"] = null,
+                              ["usage"] = new JObject { ["input_tokens"] = 0, ["output_tokens"] = 0 } } };
+                          var bs = new JObject { ["type"] = "content_block_start", ["index"] = 0, ["content_block"] = new JObject { ["type"] = "text", ["text"] = "" } };
+                          var bd = new JObject { ["type"] = "content_block_delta", ["index"] = 0, ["delta"] = new JObject { ["type"] = "text_delta", ["text"] = text } };
+                          var be = new JObject { ["type"] = "content_block_stop", ["index"] = 0 };
+                          var md = new JObject { ["type"] = "message_delta", ["delta"] = new JObject { ["stop_reason"] = "end_turn", ["stop_sequence"] = null }, ["usage"] = new JObject { ["output_tokens"] = 0 } };
+                          var ms = new JObject { ["type"] = "message_stop" };
+                          return "event: message_start\ndata: " + start.ToString(n) + "\n\n"
+                               + "event: content_block_start\ndata: " + bs.ToString(n) + "\n\n"
+                               + "event: content_block_delta\ndata: " + bd.ToString(n) + "\n\n"
+                               + "event: content_block_stop\ndata: " + be.ToString(n) + "\n\n"
+                               + "event: message_delta\ndata: " + md.ToString(n) + "\n\n"
+                               + "event: message_stop\ndata: " + ms.ToString(n) + "\n\n";
+                      }
+                      if (shape == "openai.responses") {
+                          var resp = new JObject {
+                              ["id"] = "resp_straiker_blocked", ["object"] = "response", ["created_at"] = created, ["status"] = "completed", ["model"] = model,
+                              ["output"] = new JArray { new JObject { ["id"] = "msg_straiker_blocked", ["type"] = "message", ["status"] = "completed", ["role"] = "assistant",
+                                  ["content"] = new JArray { new JObject { ["type"] = "output_text", ["text"] = text, ["annotations"] = new JArray() } } } },
+                              ["usage"] = new JObject { ["input_tokens"] = 0, ["output_tokens"] = 0, ["total_tokens"] = 0 }
+                          };
+                          if (!stream) { return resp.ToString(n); }
+                          return "event: response.completed\ndata: " + new JObject { ["type"] = "response.completed", ["response"] = resp }.ToString(n) + "\n\n";
+                      }
+                      if (shape == "openai.completion") {
+                          return new JObject {
+                              ["id"] = "cmpl-straiker-blocked", ["object"] = "text_completion", ["created"] = created, ["model"] = model,
+                              ["choices"] = new JArray { new JObject { ["index"] = 0, ["text"] = text, ["finish_reason"] = "stop", ["logprobs"] = null } },
+                              ["usage"] = new JObject { ["prompt_tokens"] = 0, ["completion_tokens"] = 0, ["total_tokens"] = 0 }
+                          }.ToString(n);
+                      }
+                      if (!stream) {
+                          return new JObject {
+                              ["id"] = "chatcmpl-straiker-blocked", ["object"] = "chat.completion", ["created"] = created, ["model"] = model,
+                              ["choices"] = new JArray { new JObject { ["index"] = 0, ["message"] = new JObject { ["role"] = "assistant", ["content"] = text }, ["finish_reason"] = "stop" } },
+                              ["usage"] = new JObject { ["prompt_tokens"] = 0, ["completion_tokens"] = 0, ["total_tokens"] = 0 }
+                          }.ToString(n);
+                      }
+                      var c1 = new JObject { ["id"] = "chatcmpl-straiker-blocked", ["object"] = "chat.completion.chunk", ["created"] = created, ["model"] = model,
+                          ["choices"] = new JArray { new JObject { ["index"] = 0, ["delta"] = new JObject { ["role"] = "assistant", ["content"] = text }, ["finish_reason"] = null } } };
+                      var c2 = new JObject { ["id"] = "chatcmpl-straiker-blocked", ["object"] = "chat.completion.chunk", ["created"] = created, ["model"] = model,
+                          ["choices"] = new JArray { new JObject { ["index"] = 0, ["delta"] = new JObject(), ["finish_reason"] = "stop" } } };
+                      return "data: " + c1.ToString(n) + "\n\ndata: " + c2.ToString(n) + "\n\ndata: [DONE]\n\n";
+                      // ---- STRAIKER_V3_STUB_END ----
+                  }</set-body>
+                </return-response>
+              </when>
+              <otherwise>
+                <set-header name="x-straiker-verdict" exists-action="override">
+                  <value>@((string)context.Variables["straikerV3FinalVerdict"])</value>
+                </set-header>
+                <set-header name="x-straiker-detail" exists-action="override">
+                  <value>@((string)context.Variables["straikerV3Detail"] + ";response=" + (string)context.Variables["straikerV3RespDetail"])</value>
+                </set-header>
+              </otherwise>
+            </choose>
+          </otherwise>
+        </choose>
+      </otherwise>
+    </choose>
+</fragment>

@@ -12,4 +12,7 @@ LOCAL_KEYS.md
 LOCAL_*.md
 *.local.md
 local-*
-.github/workflows/
+
+# e2e harness secrets
+tests/v3/.env
+tests/v3/out/

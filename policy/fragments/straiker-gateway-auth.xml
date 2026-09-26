@@ -1,0 +1,85 @@
+<!--
+  Per-developer client auth for Claude Code (and similar CLI clients).
+
+  Imported from an earlier Claude Code deployment (it was never in the
+  repo). Sets straikerUserName, which the straiker-v3-inbound and
+  straiker-coding-inbound fragments preserve as the person behind the call.
+
+  Why not APIM subscriptionRequired?
+    Built-in subscription validation runs before inbound policy and accepts only
+    one key header. Claude Code often sends Authorization: Bearer
+    (ANTHROPIC_AUTH_TOKEN), which then fails with "missing subscription key".
+
+  Contract:
+    - Coding APIs use subscriptionRequired=false.
+    - This fragment checks x-api-key OR Bearer against secret Named Value
+      straiker-client-keys: { "alice@contoso.com": "<key>", ... }.
+    - On match, sets context variable straikerUserName to the map key (email).
+    - Keep the Named Value in sync on issue / rotate / revoke (Key Vault OK).
+
+  Enterprise alternatives:
+    - validate-jwt + set straikerUserName (or straikerIdentityMode=jwt with
+      output-token-variable-name="validatedJwt"), then omit this fragment.
+    - Claude Code still needs a gateway key or your own token exchange today.
+-->
+<fragment>
+    <set-variable name="straikerClientKeysJson" value="{{straiker-client-keys}}" />
+    <set-variable name="straikerUserName" value="@{
+        string keysJson = (string)context.Variables["straikerClientKeysJson"];
+        if (string.IsNullOrEmpty(keysJson) || keysJson == "{}") { return ""; }
+        var xApi = context.Request.Headers.GetValueOrDefault("x-api-key", "");
+        var auth = context.Request.Headers.GetValueOrDefault("Authorization", "");
+        string bearer = "";
+        if (auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) { bearer = auth.Substring(7).Trim(); }
+        try {
+            var map = JObject.Parse(keysJson);
+            foreach (var prop in map.Properties()) {
+                var key = (string)prop.Value;
+                if (string.IsNullOrEmpty(key)) { continue; }
+                bool hit = false;
+                if (!string.IsNullOrEmpty(xApi)) {
+                    int len = Math.Max(xApi.Length, key.Length);
+                    int diff = xApi.Length ^ key.Length;
+                    for (int i = 0; i < len; i++) {
+                        char ca = i < xApi.Length ? xApi[i] : '\0';
+                        char cb = i < key.Length ? key[i] : '\0';
+                        diff |= ca ^ cb;
+                    }
+                    hit = diff == 0;
+                }
+                if (!hit && !string.IsNullOrEmpty(bearer)) {
+                    int len = Math.Max(bearer.Length, key.Length);
+                    int diff = bearer.Length ^ key.Length;
+                    for (int i = 0; i < len; i++) {
+                        char ca = i < bearer.Length ? bearer[i] : '\0';
+                        char cb = i < key.Length ? key[i] : '\0';
+                        diff |= ca ^ cb;
+                    }
+                    hit = diff == 0;
+                }
+                if (hit) { return prop.Name; }
+            }
+        } catch { }
+        return "";
+    }" />
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["straikerUserName"]))">
+        <return-response>
+          <set-status code="401" reason="Unauthorized" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-header name="x-straiker-auth-hint" exists-action="override">
+            <value>@{
+                var xApi = context.Request.Headers.GetValueOrDefault("x-api-key", "");
+                var auth = context.Request.Headers.GetValueOrDefault("Authorization", "");
+                var hasX = !string.IsNullOrEmpty(xApi);
+                var hasB = auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) && auth.Length > 7;
+                return "x-api-key=" + (hasX ? "present" : "absent") + "; bearer=" + (hasB ? "present" : "absent");
+            }</value>
+          </set-header>
+          <set-body>{"type":"error","error":{"type":"authentication_error","message":"Missing or invalid per-user gateway key. Present the key from straiker-client-keys as x-api-key (ANTHROPIC_API_KEY) or Authorization: Bearer (ANTHROPIC_AUTH_TOKEN)."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+</fragment>

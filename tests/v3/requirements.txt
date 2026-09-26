@@ -1,0 +1,7 @@
+# tests/v3 live harness (Python 3.10+). Versions are the ones the harness was last run with.
+requests==2.34.2
+# foundry_sdk_test.py only (Azure AI Agents SDK pointed at APIM)
+azure-ai-agents==1.1.0
+azure-identity==1.25.3
+azure-core==1.41.0
+# cc_test.py / probes also drive the `claude` and `codex` CLIs, installed separately.

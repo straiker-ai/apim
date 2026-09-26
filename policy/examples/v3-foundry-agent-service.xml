@@ -1,0 +1,39 @@
+<!--
+  v3 platform, Azure AI Foundry Agent Service (threads / runs; the API the Azure AI
+  Agents SDK calls). API backend: https://<resource>.services.ai.azure.com/api/projects/<project>,
+  operations POST/GET/DELETE /*. The caller's Entra token authenticates to Foundry and
+  identifies the user; APIM validates it and passes it through.
+
+  Guarded inline (blocked with 400 content_filter before the content reaches the thread):
+  message create, thread create with messages, create-and-run, run additional_messages,
+  submit_tool_outputs. Passed through: run create without messages, polling, listing,
+  agent CRUD. The run's model calls and Foundry-executed tools are not visible to APIM.
+
+  Clients change only the endpoint:
+    AgentsClient(endpoint="https://<apim>.azure-api.net/<api-path>", credential=...)
+
+  Named Value: straiker-api-key (sk_agt_).
+-->
+<policies>
+  <inbound>
+    <base />
+    <validate-azure-ad-token tenant-id="<your-tenant-id>" output-token-variable-name="validatedJwt" failed-validation-httpcode="401">
+      <audiences>
+        <audience>https://ai.azure.com</audience>
+      </audiences>
+    </validate-azure-ad-token>
+    <set-variable name="straikerIdentityMode" value="jwt" />
+    <set-variable name="straikerAgentRef" value="Order Support Agent" />
+    <include-fragment fragment-id="straiker-v3-inbound" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-v3-outbound" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

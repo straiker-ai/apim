@@ -1,0 +1,41 @@
+<!--
+  v3 platform, Claude Code through APIM to Anthropic (or Claude on Bedrock /
+  Foundry behind the same route). Developers set:
+    ANTHROPIC_BASE_URL=https://<apim>.azure-api.net/<api-path>
+    ANTHROPIC_AUTH_TOKEN=<their key from the straiker-client-keys map>
+    unset ANTHROPIC_API_KEY
+  straiker-gateway-auth maps the key to the developer's email; the v3
+  fragment recognises the claude-cli/ User-Agent, names the application
+  "Claude (APIM)" and sends x-s6r-client: claude on every call (sidecar calls
+  included, so the session never splits). The response phase is synchronous
+  so a denied tool call is stopped before Claude Code runs it; that buffers
+  streaming on this route (set straikerResponsePhase=async to keep
+  token-by-token streaming and lose pre-execution blocking).
+
+  Named Values: straiker-api-key (sk_agt_), straiker-client-keys (JSON map),
+  anthropic-backend-key. subscriptionRequired=false on this API.
+-->
+<policies>
+  <inbound>
+    <base />
+    <include-fragment fragment-id="straiker-gateway-auth" />
+    <include-fragment fragment-id="straiker-v3-inbound" />
+    <set-header name="x-api-key" exists-action="override">
+      <value>{{anthropic-backend-key}}</value>
+    </set-header>
+    <set-header name="Authorization" exists-action="delete" />
+    <set-header name="anthropic-version" exists-action="skip">
+      <value>2023-06-01</value>
+    </set-header>
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-v3-outbound" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

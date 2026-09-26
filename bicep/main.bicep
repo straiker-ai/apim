@@ -12,9 +12,12 @@
 @description('Name of the existing API Management instance.')
 param apimName string
 
-@description('Straiker DefendAI API key. Stored as an APIM Named Value secret.')
+@description('Straiker key. Stored as an APIM Named Value secret (sk_agt_ for --contract v3, a UUID for rich/webhook).')
 @secure()
 param straikerApiKey string
+
+@description('Name of the Named Value that holds the key. The fragments read {{straiker-api-key}} by default; use another name (e.g. straiker-v3-api-key) to keep a v1 and a v3 key side by side on one instance during a migration, and set straikerApiKey from it in the API policy before the include.')
+param keyNamedValueName string = 'straiker-api-key'
 
 @description('Name of the API to attach the Straiker policy to. If createTestApi=true, this API is created pointing at api.openai.com.')
 param targetApiName string = 'openai-protected'
@@ -28,9 +31,16 @@ param testBackendUrl string = 'https://api.openai.com'
 @description('Deploy the generated single-file policy instead of fragments. Fragments are the canonical path; the monolith exists for portal paste-in parity.')
 param useMonolith bool = false
 
-@description('Detect contract: "rich" = /api/v1/detect[?agentic] with local score>threshold blocking (shipping default); "webhook" = /api/v1/detect/webhook with server-side action blocking (Bridge convergence). Both fragment pairs are registered either way; this picks which pair the thin policy includes.')
-@allowed(['rich', 'webhook'])
-param contract string = 'rich'
+@description('Detect contract: "v3" = POST /api/v3/detect with an sk_agt_ integration key (v3 platform: verdicts, agent enumeration, Kong/LiteLLM parity); "rich" = /api/v1/detect[?agentic] with local score>threshold blocking (v1 UUID key); "webhook" = /api/v1/detect/webhook (v1, preview). All fragment pairs are registered either way; this picks which pair the thin policy includes. The key generation must match: sk_agt_ for v3, UUID for rich/webhook.')
+@allowed(['rich', 'webhook', 'v3'])
+param contract string = 'v3'
+
+@description('Attach the thin include-fragment policy to targetApiName. Set false to only register the fragments and Named Values (for instances where the consuming APIs carry their own policy).')
+param attachPolicy bool = true
+
+@description('Optional JSON map {"alice@contoso.com": "<key>"} for the straiker-gateway-auth fragment (per-developer keys for Claude Code). Empty = the fragment and its Named Value are not registered.')
+@secure()
+param clientKeysJson string = ''
 
 @description('Inline policy XML. Only used when useMonolith=true; the deploy script substitutes policy/straiker-policy.xml here.')
 param policyXml string = ''
@@ -43,9 +53,9 @@ resource apim 'Microsoft.ApiManagement/service@2023-05-01-preview' existing = {
 //    Production: switch the `value` to a Key Vault reference via keyVault block.
 resource straikerKeyNV 'Microsoft.ApiManagement/service/namedValues@2023-05-01-preview' = {
   parent: apim
-  name: 'straiker-api-key'
+  name: keyNamedValueName
   properties: {
-    displayName: 'straiker-api-key'
+    displayName: keyNamedValueName
     secret: true
     value: straikerApiKey
   }
@@ -106,17 +116,67 @@ resource webhookOutboundFragment 'Microsoft.ApiManagement/service/policyFragment
   ]
 }
 
+resource v3InboundFragment 'Microsoft.ApiManagement/service/policyFragments@2023-05-01-preview' = if (!useMonolith) {
+  parent: apim
+  name: 'straiker-v3-inbound'
+  properties: {
+    format: 'rawxml'
+    value: loadTextContent('../policy/fragments/straiker-v3-inbound.xml')
+    description: 'Straiker v3 platform request phase: relays the provider body to /api/v3/detect, enforces permissionDecision (Kong/LiteLLM parity)'
+  }
+  dependsOn: [
+    straikerKeyNV
+  ]
+}
+
+resource v3OutboundFragment 'Microsoft.ApiManagement/service/policyFragments@2023-05-01-preview' = if (!useMonolith) {
+  parent: apim
+  name: 'straiker-v3-outbound'
+  properties: {
+    format: 'rawxml'
+    value: loadTextContent('../policy/fragments/straiker-v3-outbound.xml')
+    description: 'Straiker v3 platform response phase: response-sync envelope to /api/v3/detect, replaces a denied answer or tool call'
+  }
+  dependsOn: [
+    straikerKeyNV
+  ]
+}
+
+resource clientKeysNV 'Microsoft.ApiManagement/service/namedValues@2023-05-01-preview' = if (clientKeysJson != '') {
+  parent: apim
+  name: 'straiker-client-keys'
+  properties: {
+    displayName: 'straiker-client-keys'
+    secret: true
+    value: clientKeysJson
+  }
+}
+
+resource gatewayAuthFragment 'Microsoft.ApiManagement/service/policyFragments@2023-05-01-preview' = if (clientKeysJson != '') {
+  parent: apim
+  name: 'straiker-gateway-auth'
+  properties: {
+    format: 'rawxml'
+    value: loadTextContent('../policy/fragments/straiker-gateway-auth.xml')
+    description: 'Per-developer gateway auth (x-api-key or Bearer -> email) for Claude Code through APIM'
+  }
+  dependsOn: [
+    clientKeysNV
+  ]
+}
+
 // Thin per-API policy used in fragment mode. Per-API knobs (straikerSource,
 // straikerAgentic, ...) belong in the consuming API's own policy before the
 // include-fragment lines - see policy/examples/.
-var inboundFragmentId = contract == 'webhook' ? 'straiker-webhook-inbound' : 'straiker-defendai-inbound'
-var outboundFragmentId = contract == 'webhook' ? 'straiker-webhook-outbound' : 'straiker-defendai-outbound'
+var inboundFragmentId = contract == 'v3' ? 'straiker-v3-inbound' : (contract == 'webhook' ? 'straiker-webhook-inbound' : 'straiker-defendai-inbound')
+var outboundFragmentId = contract == 'v3' ? 'straiker-v3-outbound' : (contract == 'webhook' ? 'straiker-webhook-outbound' : 'straiker-defendai-outbound')
 
+var keyOverride = keyNamedValueName == 'straiker-api-key' ? '' : '<set-variable name="straikerApiKey" value="{{${keyNamedValueName}}}" />\n    '
 var fragmentPolicyXml = '''
 <policies>
   <inbound>
     <base />
-    <include-fragment fragment-id="__INBOUND__" />
+    __KEY__<include-fragment fragment-id="__INBOUND__" />
   </inbound>
   <backend>
     <base />
@@ -133,7 +193,7 @@ var fragmentPolicyXml = '''
 
 var effectivePolicyXml = useMonolith
   ? policyXml
-  : replace(replace(fragmentPolicyXml, '__INBOUND__', inboundFragmentId), '__OUTBOUND__', outboundFragmentId)
+  : replace(replace(replace(fragmentPolicyXml, '__KEY__', keyOverride), '__INBOUND__', inboundFragmentId), '__OUTBOUND__', outboundFragmentId)
 
 // 3. Optional passthrough test API (mirrors kong-plugin-demo openai-standard route).
 resource testApi 'Microsoft.ApiManagement/service/apis@2023-05-01-preview' = if (createTestApi) {
@@ -160,7 +220,7 @@ resource testOp 'Microsoft.ApiManagement/service/apis/operations@2023-05-01-prev
 
 // 4. Apply the Straiker policy to the API. dependsOn the named value + fragments
 //    so {{straiker-api-key}} and <include-fragment> references resolve at save.
-resource attachExisting 'Microsoft.ApiManagement/service/apis/policies@2023-05-01-preview' = if (!createTestApi) {
+resource attachExisting 'Microsoft.ApiManagement/service/apis/policies@2023-05-01-preview' = if (!createTestApi && attachPolicy) {
   name: '${apimName}/${targetApiName}/policy'
   properties: {
     format: 'rawxml'
@@ -172,6 +232,8 @@ resource attachExisting 'Microsoft.ApiManagement/service/apis/policies@2023-05-0
     outboundFragment
     webhookInboundFragment
     webhookOutboundFragment
+    v3InboundFragment
+    v3OutboundFragment
   ]
 }
 
@@ -188,6 +250,8 @@ resource attachNew 'Microsoft.ApiManagement/service/apis/policies@2023-05-01-pre
     outboundFragment
     webhookInboundFragment
     webhookOutboundFragment
+    v3InboundFragment
+    v3OutboundFragment
   ]
 }
 
