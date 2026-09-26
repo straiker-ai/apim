@@ -1,0 +1,28 @@
+<!--
+  v3 platform, Azure OpenAI (or any OpenAI-shaped backend), one application
+  per API. The APIM subscription is the identity; the operator pins the
+  application name so callers cannot rename it.
+
+  Named Value: straiker-api-key = sk_agt_... (Console: Add Agent -> gateway)
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="straikerAgentRef" value="Billing Copilot" />
+    <include-fragment fragment-id="straiker-v3-inbound" />
+    <set-header name="api-key" exists-action="override">
+      <value>{{aoai-backend-key}}</value>
+    </set-header>
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-v3-outbound" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

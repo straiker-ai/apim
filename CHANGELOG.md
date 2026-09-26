@@ -1,6 +1,103 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - v3 platform (2026-09-26)
+
+- **v3 platform support** — new fragment pair `straiker-v3-{inbound,outbound}.xml` for
+  tenants that issue `sk_agt_` integration keys. One pair for chat, agentic and coding-agent
+  traffic; the body decides. Speaks the Kong v0.12 / LiteLLM gateway contract byte-for-byte:
+  allowlisted provider body + `session_id` + `original.processed.Meta.user` on the request
+  phase, `{straiker_phase:"response-sync", sse, model, request}` on the response phase,
+  `x-s6r-agent` / `x-s6r-client` / `x-s6r-format` hints, `X-S6r-Ingress: gw-azure-apim`;
+  verdict from `hookSpecificOutput.permissionDecision` / `blocked_by`. No `x-tool`,
+  `x-straiker-phase`, `Straiker-Debug` or flat prompt fields. Docs: `docs/v3-platform.md`.
+  - **Agent enumeration** like Kong/LiteLLM: `straikerAgentRef` pins the application
+    (beats the caller), else the caller's `x-s6r-agent`, else Claude Code from its
+    User-Agent as `Claude (APIM)`, else the platform catch-all `Autonomous (<gateway type>)`.
+  - **Identity** from the authenticated principal first (`straikerIdentityMode` =
+    `subscription` | `jwt` | `headers`; `straiker-gateway-auth` per-developer keys preserved),
+    never Claude Code's hashed `metadata.user_id`.
+  - **Sessions** derived like LiteLLM (sha256 of principal + application name + preamble +
+    first user turn, role-checked, all text blocks) and always written into the body — the
+    platform ignores the `x-claude-code-session-id` header on v3. The application name is in
+    the seed because one key fronts many applications: a session belongs to the application
+    that opened it (measured: identical prompts under two application names merged into one
+    session owned by the first).
+  - **Streaming**: Anthropic SSE relayed raw; an Azure/OpenAI `chat.completion.chunk` stream
+    is reassembled into a `chat.completion` before scoring (the platform does not read the
+    chunk format); Responses streams reduced to `response.completed`. Sync response phase
+    buffers; `straikerResponsePhase=async` keeps token streaming (advisory).
+  - **Blocking** as HTTP 200 provider-shaped stub (Anthropic/OpenAI/Responses/completion,
+    SSE when streamed) with the tenant message; `http-400` / `http-403` optional. Response-phase
+    denies replace the answer. **Replay memory** (APIM cache, 24h) re-blocks a resend or a
+    conversation grown past a control-named block without a platform call.
+  - **Failure policy** `straikerFailClosed` (default open, `x-straiker-verdict: degraded`),
+    30 s timeout, 4 MiB cap, one retry on 502/503/504; wrong-generation key -> explicit 503.
+  - **Secret hygiene**: `tools[]` / `mcp_servers[]` `headers|authorization|authorization_token`
+    -> `[redacted]`; never relays the subscription key or the client's `Authorization`.
+  - `x-straiker-verdict` (`allow|detect|block|degraded|unknown`) + `x-straiker-detail` on every
+    response.
+  - **Coding agents beyond Claude Code**: the client is read from the User-Agent (`claude-cli/` →
+    `claude`, `codex_exec/` / `codex_cli` → `codex` as `Codex (APIM)`, `opencode` → `opencode`,
+    `cursor/` → `cursor`; `straikerClient` overrides for Cursor / Copilot), Codex's `session-id`
+    header joins the session chain. Codex CLI verified through the OpenAI-compatible route with
+    per-developer keys; `Codex (APIM)` lands as `coding_agent`.
+  - **Automatic agent enumeration** (`straikerAgentNameFrom`, default `api`): with nothing
+    naming the application, it is named after the APIM API's display name, or the
+    subscription, product or calling Entra application; `none` keeps the platform catch-all.
+  - **One shape per agent**: an agent's archetype is fixed by its first traffic and only the
+    matching shape is scored afterwards (measured), so text completions and Foundry agent
+    messages are relayed as `messages` like every other non-coding request.
+  - **Azure AI Foundry Agent Service**: message create, thread create with messages,
+    create-and-run, run `additional_messages` and `submit_tool_outputs` are scored and blocked
+    with `400 content_filter` before the content reaches the thread; control calls pass through;
+    session = thread id. Verified against a real agent (REST and the Azure AI Agents SDK).
+  - Routes that never carry a turn (embeddings, `count_tokens`, `/models`, audio, images,
+    moderations, files, batches, realtime) are skipped automatically (`unknown`, `detail=route`).
+  - Relayed body also carries `user_name` (the flat text-completion path reads it; a completion
+    session had no identity without it) and `network` (`ip`, `user_agent`). JWT identity chain
+    accepts app-only Entra tokens (`app_displayname` → `azp` → `appid`).
+- **Security review hardening (v3 fragments).**
+  - The integration key and the relayed conversation are sent only to `https://*.straiker.ai`;
+    any other `straikerDetectUrl` is refused with HTTP 503 `config-error` unless
+    `straikerAllowCustomDetectUrl=true`, and a relative or plain-`http` URL is refused even then
+    (it previously surfaced as a bare HTTP 500).
+  - A POST body the gateway cannot read as a JSON object, on a route it scores (not JSON, trailing
+    bytes, nesting deeper than the 64 levels APIM's parser accepts), was forwarded unscored as
+    `unknown`. It is now refused with HTTP 400 `straiker_uninspectable_request`
+    (`straikerBlockUnparseable`, default `true`; `false` forwards it as `degraded`).
+  - The size cap is measured on the compact JSON, so whitespace padding cannot push a small prompt
+    past `straikerMaxBodyBytes` and out of inspection.
+  - Route skips (embeddings, audio, images, files, ...) apply only when the path does not end in a
+    chat, completion, response, message, thread or run operation, so a deployment named like a
+    skipped route (an Azure OpenAI deployment called `audio`) is still scored.
+  - The caller's `x-s6r-agent`, the client value and the principal are stripped of control
+    characters and length-capped before they are sent.
+  - Matrix cases 31-36 pin each fix; `tests/v3/mutation_check.py` reverts each fix on a dev instance
+    and requires its case to fail (7/7).
+- **Test harness.** Settings come from `tests/v3/.env`, `$STRAIKER_ENV_FILE` and the environment
+  (`tests/v3/harness_env.py`), with no machine paths or tenant identifiers in the code;
+  `tests/v3/requirements.txt` pins the Python dependencies. The test APIs honour `x-test-*`
+  overrides only with `x-test-token` (a secret Named Value), so a subscription key alone cannot
+  repoint the detect URL. `setup_dev_apis.py` now follows APIM's asynchronous policy validation
+  (a rejected fragment previously looked successful and left the old version running) and reads
+  every fragment back to prove the new content is live.
+- `straiker-gateway-auth.xml` (per-developer keys for Claude Code, from an earlier
+  deployment) is now in the repo and registered by bicep when
+  `clientKeysJson` is supplied.
+- `deploy.sh --contract v3` (default; `rich` / `webhook` for v1 UUID keys, enforced by key
+  prefix), `--no-attach`; bicep registers the v3 pair and takes `attachPolicy` /
+  `clientKeysJson`.
+- `scripts/check-fragments.sh` static gates (tag balance, literal one-way timeouts, identical
+  block-stub builder in both v3 fragments, no v1-era headers in v3 fragments); CI runs it.
+- `tests/v3/` live harness: dev-instance setup, client-side matrix, console verification,
+  enforcement (block / post-call / replay / kill switch), real Claude Code, load/latency,
+  wire tap.
+- `policy/examples/v3-*.xml`: Azure OpenAI pinned app, shared route with Entra identity,
+  Claude Code, detect-only streaming.
+- Fix: the coding-v1 fragment's `straikerFailOpen` knob was never read (always failed open);
+  `docs/coding-agents.md` said otherwise.
+
+## Unreleased (v1 contracts)
 
 - **Coding-agent (Claude Code) support** — new fragment pair
   `straiker-coding-{inbound,outbound}.xml` protects coding agents routed through APIM.

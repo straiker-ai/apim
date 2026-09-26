@@ -1,0 +1,30 @@
+<!--
+  v3 platform, Azure AI Foundry models (models inference endpoint or an Azure OpenAI
+  deployment). API backend: https://<resource>.services.ai.azure.com/models
+  (or https://<resource>.openai.azure.com). Prompt, tool calls and results, and the
+  answer (streaming included) are inspected; a violation is stopped before it reaches
+  the application. Omit straikerAgentRef to name the application after this API.
+
+  Named Values: straiker-api-key (sk_agt_), foundry-api-key.
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="straikerAgentRef" value="Claims Assistant" />
+    <include-fragment fragment-id="straiker-v3-inbound" />
+    <set-header name="api-key" exists-action="override">
+      <value>{{foundry-api-key}}</value>
+    </set-header>
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-v3-outbound" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

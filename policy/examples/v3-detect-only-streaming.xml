@@ -1,0 +1,30 @@
+<!--
+  v3 platform, detection only with streaming preserved: the request phase is
+  scored synchronously (a blocked prompt never reaches the model), the answer
+  is posted asynchronously and recorded (never blocked). Use this on routes
+  where time-to-first-token matters more than pre-execution blocking, and on
+  routes that must never score at all (count_tokens, embeddings, /models)
+  set both straikerScoreRequest and straikerScoreResponse to false.
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="straikerAgentRef" value="Support Assistant" />
+    <set-variable name="straikerResponsePhase" value="async" />
+    <include-fragment fragment-id="straiker-v3-inbound" />
+    <set-header name="Authorization" exists-action="override">
+      <value>Bearer {{openai-backend-key}}</value>
+    </set-header>
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-v3-outbound" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

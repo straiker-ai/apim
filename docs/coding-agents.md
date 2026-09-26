@@ -1,3 +1,5 @@
+> **v3 tenants (`sk_agt_` keys):** use `straiker-v3-inbound` / `straiker-v3-outbound` instead — see [v3-platform.md](v3-platform.md). This page describes the v1 coding contract.
+
 # Coding agents (Claude Code) through Azure APIM
 
 Protect developers' coding agents — Claude Code and other Anthropic-Messages-shaped
@@ -97,7 +99,7 @@ optional; string values work (`value="detect"`) as well as typed expressions.
 | `straikerDetectUrl` | `https://api.prod.straiker.ai/api/v1/detect` | Detect endpoint. Change for a regional or dedicated tenant. |
 | `straikerBlockMode` | `anthropic-stub` | How a block is returned in `enforce` mode. `anthropic-stub` = HTTP 200 carrying a well-formed Anthropic message (the agent shows the reason and ends the turn cleanly — recommended). `http-403` = a JSON error, which most agents surface as a connection failure. |
 | `straikerTimeoutSec` | `5` | Timeout for the detect call in `enforce` mode. |
-| `straikerFailOpen` | `true` | If Straiker is unreachable in `enforce` mode, allow the request. Set `false` to fail closed. |
+| `straikerFailOpen` | `true` | Documented as fail-open/fail-closed, but the v1 coding fragment never reads it: it always fails open (a non-200 from Straiker is simply not a block). For a real fail-closed use the v3 fragments' `straikerFailClosed`. |
 
 ### Request headers the policy honours
 

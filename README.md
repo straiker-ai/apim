@@ -1,12 +1,26 @@
 # Straiker DefendAI policy for Azure API Management
 
-A drop-in Azure APIM policy that adds Straiker DefendAI guardrails to any LLM API exposed through the [APIM AI Gateway](https://learn.microsoft.com/azure/api-management/genai-gateway-capabilities).
+A drop-in Azure APIM policy that adds Straiker DefendAI guardrails to any LLM or agent API exposed through the [APIM AI Gateway](https://learn.microsoft.com/azure/api-management/genai-gateway-capabilities), including Azure AI Foundry models and the Foundry Agent Service. On the v3 platform it speaks the same wire contract as the [Straiker Kong plugin](https://github.com/straiker-ai/kong) and the LiteLLM guardrail.
 
-Mirrors the design of the [Straiker Kong plugin](https://github.com/straiker-ai/kong): pre-call detection with `HTTP 403` blocking, post-call observability, agentic mode (`/detect?agentic`) with agent-loop deduping, and session/trace correlation via headers.
-
-> **Not sure which Azure integration model you need?** This repo is the **custom-policy** approach — customer keeps the Azure model credentials in APIM. The earlier **Foundry Gateway proxy** is a faster-to-deploy alternative where Straiker holds the upstream credentials and ships with a built-in multi-model catalog (`gpt-4.1`, Mistral, Phi, DeepSeek, Grok). Both are production-ready; pick based on your trust model. Decision matrix in [`docs/choosing-your-integration.md`](docs/choosing-your-integration.md).
+> **Not sure which Azure integration model you need?** This repo is the **custom-policy** approach: your model credentials stay in APIM. The alternative is a proxy through the Straiker AI Gateway, where Straiker holds the upstream credentials. Decision matrix in [`docs/choosing-your-integration.md`](docs/choosing-your-integration.md).
 
 ---
+
+## Which contract: v3 or v1
+
+The key the Straiker Console gives you decides which fragments you deploy:
+
+| Key | Platform | Fragments | Deploy |
+|---|---|---|---|
+| `sk_agt_...` | v3 | `straiker-v3-inbound` / `straiker-v3-outbound` | `deploy.sh <rg> <apim> --contract v3` (default) |
+| UUID | v1 | `straiker-defendai-*` (rich), `straiker-webhook-*`, `straiker-coding-*` | `--contract rich` / `--contract webhook` |
+
+v3 is one fragment pair for chat, agentic, coding-agent and Azure AI Foundry (models and the
+Agent Service) traffic on the same wire contract
+as the Straiker Kong plugin and the LiteLLM guardrail (agent enumeration with `x-s6r-agent`,
+identity from the authenticated principal, `permissionDecision` verdicts, provider-shaped
+block stubs, replay memory). Read **[docs/v3-platform.md](docs/v3-platform.md)** first.
+The sections below describe the v1 (rich) contract.
 
 ## What it does
 
@@ -27,32 +41,45 @@ Customer keeps their own provider keys (Azure OpenAI, OpenAI, Anthropic-via-Bedr
 apim-policy-straiker/
 ├── policy/
 │   ├── fragments/                   # SOURCE OF TRUTH — deployed as APIM Policy Fragments
-│   │   ├── straiker-defendai-inbound.xml          # pre-call detection + block
-│   │   └── straiker-defendai-outbound.xml         # post-call detection (+ optional output block)
-│   ├── straiker-policy.xml          # GENERATED single-file paste-in (scripts/build-monolith.sh)
+│   │   ├── straiker-v3-inbound.xml                # v3 platform (sk_agt_ keys): request phase
+│   │   ├── straiker-v3-outbound.xml               # v3 platform: response phase (response-sync)
+│   │   ├── straiker-gateway-auth.xml              # per-developer keys for Claude Code -> straikerUserName
+│   │   ├── straiker-defendai-inbound.xml          # v1 rich: pre-call detection + block
+│   │   ├── straiker-defendai-outbound.xml         # v1 rich: post-call detection (+ optional output block)
+│   │   ├── straiker-webhook-{inbound,outbound}.xml  # v1 /detect/webhook preview
+│   │   └── straiker-coding-{inbound,outbound}.xml   # v1 Claude Code hook-event / raw-body contract
+│   ├── straiker-policy.xml          # GENERATED single-file paste-in of the rich pair (scripts/build-monolith.sh)
 │   └── examples/
-│       ├── chatbot-mode.xml                       # agentic=false config knobs
-│       ├── agentic-mode.xml                       # agentic=true config knobs
-│       ├── agentic-api.xml                        # full agentic API policy using fragments
-│       ├── azure-openai-passthrough.xml           # gpt-* via cognitiveservices endpoint
-│       ├── azure-foundry-models-passthrough.xml   # Mistral/Phi via services.ai endpoint
-│       └── foundry-third-party-api.xml            # Foundry third-party models, full policy
+│       ├── v3-azure-openai.xml                    # v3: Azure OpenAI API pinned to one application
+│       ├── v3-shared-route.xml                    # v3: one route, many apps (x-s6r-agent) + Entra identity
+│       ├── v3-claude-code.xml                     # v3: Claude Code via gateway-auth, sync tool blocking
+│       ├── v3-detect-only-streaming.xml           # v3: async response phase, streaming preserved
+│       ├── v3-foundry-models.xml                  # v3: Azure AI Foundry models / Azure OpenAI
+│       ├── v3-foundry-agent-service.xml           # v3: Azure AI Foundry Agent Service (threads/runs)
+│       ├── chatbot-mode.xml / agentic-mode.xml / agentic-api.xml          # v1 rich knobs
+│       └── azure-openai-passthrough.xml / azure-foundry-models-passthrough.xml / foundry-third-party-api.xml
 ├── docs/
-│   ├── agentic-mode.md              # agentic behaviour deep-dive + multi-provider matrix
+│   ├── v3-platform.md               # v3 contract, naming, identity, sessions, enforcement, knobs, testing
+│   ├── agentic-mode.md              # v1 agentic behaviour + multi-provider matrix
+│   ├── coding-agents.md             # v1 coding contract
 │   └── choosing-your-integration.md # custom policy vs Foundry Gateway proxy decision matrix
 ├── bicep/
-│   ├── main.bicep                   # Named Value + policy fragments + include-fragment policy
+│   ├── main.bicep                   # Named Values + every fragment pair + thin include-fragment policy
 │   └── parameters.example.json
 ├── deploy/
-│   └── deploy.sh                    # az cli wrapper around bicep (fragments by default)
+│   └── deploy.sh                    # az cli wrapper: --contract v3|rich|webhook, --no-attach, --key-named-value
 ├── scripts/
-│   └── build-monolith.sh            # regenerate straiker-policy.xml from the fragments
+│   ├── check-fragments.sh           # static gates (tag balance, literal one-way timeouts, v3 stub parity)
+│   └── build-monolith.sh            # regenerate straiker-policy.xml from the rich fragments
 ├── dev/                             # local self-hosted gateway dev loop
-├── examples/agent-runner/           # FastAPI reference agent loop (input + output gating demo)
+├── examples/                        # agent-runner (FastAPI), coding-agent traffic generator, MCP enterprise
 └── tests/
-    ├── test.sh                      # benign + adversarial curl tests
-    ├── agentic_test.py              # full agent loop with 4 real tools
-    └── multi_agent_trace.py         # researcher→writer 2-agent trace correlation
+    ├── v3/                          # live v3 harness: setup_dev_apis, e2e_matrix, console_verify,
+    │                                #   block_test, cc_test, load_test, wire_tap (see docs/v3-platform.md)
+    ├── test.sh                      # v1 benign + adversarial curl tests
+    ├── agentic_test.py              # v1 full agent loop with 4 real tools
+    ├── multi_agent_trace.py         # v1 researcher→writer 2-agent trace correlation
+    └── webhook_contract_test.py     # v1 webhook envelope canary
 ```
 
 ---

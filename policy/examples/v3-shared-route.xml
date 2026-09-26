@@ -1,0 +1,32 @@
+<!--
+  v3 platform, one API shared by several applications. Each caller names its
+  application with `x-s6r-agent: <name>`; the platform creates one agent per
+  name on first use, and anything unnamed lands in the catch-all
+  "Autonomous (<gateway type>)". Identity comes from the caller's Entra token
+  (validate-azure-ad-token writes it to `validatedJwt`).
+-->
+<policies>
+  <inbound>
+    <base />
+    <validate-azure-ad-token tenant-id="{{entra-tenant-id}}" output-token-variable-name="validatedJwt">
+      <client-application-ids>
+        <application-id>{{entra-client-app-id}}</application-id>
+      </client-application-ids>
+    </validate-azure-ad-token>
+    <set-variable name="straikerIdentityMode" value="jwt" />
+    <include-fragment fragment-id="straiker-v3-inbound" />
+    <set-header name="Authorization" exists-action="override">
+      <value>Bearer {{openai-backend-key}}</value>
+    </set-header>
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <include-fragment fragment-id="straiker-v3-outbound" />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

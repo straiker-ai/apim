@@ -31,7 +31,7 @@
     gateway  Forwards the RAW request body, posts x-tool: kong-claude-code and
              lets Straiker build the events server-side. Requires the gateway
              path to be enabled on the tenant - until then the endpoint returns
-             HTTP 400.
+             HTTP 400. On a v3 tenant (sk_agt_ keys) use straiker-v3-* instead.
   ===============================================================
 -->
 <fragment>
